@@ -145,19 +145,21 @@ CONFIG = {
     "hurst_mr_thresh":  _env("HURST_MR",      0.45),  # below → mean-reverting
     "hurst_tr_thresh":  _env("HURST_TR",      0.55),  # above → trending
 
-    # ── EXPIRYRANGE Monte Carlo ───────────────────────────────────
-    # Candidate barrier widths as multiples of local σ×√T.
-    # 0.5σ→tight (high p(win) but low payout), 2.5σ→wide (low p, high payout).
+    # ── EXPIRYRANGE ───────────────────────────────────────────────
+    # Valid durations confirmed from live API testing.
+    # Min 2 minutes, max 15 minutes as per trading requirements.
+    "er_durations":     [120, 180, 300, 600, 900],  # seconds (2m,3m,5m,10m,15m)
     "er_sigma_mults":   [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5],
-    "er_durations":     [5, 10, 15, 30, 60, 120, 300],  # seconds (1HZ = 1s/tick)
     "er_n_sims":        _env("ER_SIMS",    1000),
-    "er_top_k":         _env("ER_TOP_K",      6),    # top candidates to quote
-    "er_min_ev":        _env("ER_MIN_EV",  0.02),    # required EV margin over 0
+    "er_top_k":         _env("ER_TOP_K",      6),
+    "er_min_ev":        _env("ER_MIN_EV",  0.02),
 
-    # ── NOTOUCH Monte Carlo ───────────────────────────────────────
-    # Candidate barrier distances as multiples of local σ×√T.
+    # ── NOTOUCH ───────────────────────────────────────────────────
+    # Single barrier only on 1HZ synthetic indices — price must NOT
+    # touch the barrier above current spot. Upper barrier (+offset) only.
+    "nt_single_barrier": True,
     "nt_sigma_mults":   [1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-    "nt_durations":     [5, 10, 15, 30, 60, 120, 300],  # seconds
+    "nt_durations":     [120, 180, 300, 600, 900],  # seconds (2m–15m)
     "nt_n_sims":        _env("NT_SIMS",    1000),
     "nt_top_k":         _env("NT_TOP_K",      6),
     "nt_min_ev":        _env("NT_MIN_EV",  0.02),
@@ -165,7 +167,7 @@ CONFIG = {
     # ── Kelly stake sizing ────────────────────────────────────────
     "kelly_fraction":   _env("KELLY_FRAC",   0.25),  # quarter-Kelly (conservative)
     "min_stake":        _env("MIN_STAKE",    1.00),
-    "max_stake_pct":    _env("MAX_STAKE_PCT", 0.05), # max 5% of balance per trade
+    "max_stake_pct":    _env("MAX_STAKE_PCT", 0.02), # max 2% of balance per trade
 
     # ── Session risk limits ───────────────────────────────────────
     "target_profit":     _env("TARGET_PROFIT",   0.0),   # 0 = disabled
@@ -957,7 +959,6 @@ class DerivClient:
     async def fetch_nt_quote(self, symbol: str, cand: NTCandidate,
                              stake: float) -> Optional[float]:
         half_dist = cand.barrier_dist
-        single = self.cfg.get(f"{symbol}_nt_single_barrier", False)
         req = {
             "proposal":           1,
             "amount":             stake,
@@ -967,15 +968,11 @@ class DerivClient:
             "duration":           cand.duration_s,
             "duration_unit":      "s",
             "underlying_symbol":  symbol,
+            # Single upper barrier only: price must not touch the level above.
+            "barrier":            f"+{half_dist:.2f}",
         }
-        if single:
-            # Single barrier NOTOUCH — use upper barrier only (price stays below)
-            req["barrier"] = f"+{half_dist:.2f}"
-        else:
-            req["barrier"]  = f"+{half_dist:.2f}"
-            req["barrier2"] = f"-{half_dist:.2f}"
         return await self._fetch_proposal_ratio(
-            req, f"NOTOUCH {symbol} {cand.duration_s}s ±{half_dist:.2f}", cand.p_win_mc)
+            req, f"NOTOUCH {symbol} {cand.duration_s}s +{half_dist:.2f}", cand.p_win_mc)
 
     async def _fetch_proposal_ratio(self, req: dict, label: str,
                                     p_win_mc: float) -> Optional[float]:
@@ -1035,9 +1032,7 @@ class DerivClient:
         }
         if contract_type == "EXPIRYRANGE":
             req["barrier2"] = f"-{half_width:.2f}"
-        elif contract_type == "NOTOUCH":
-            if not self.cfg.get(f"{sig.symbol}_nt_single_barrier", False):
-                req["barrier2"] = f"-{half_width:.2f}"
+        # NOTOUCH: single upper barrier only on 1HZ synthetic indices
 
         proposal = await self.send_with_id(req, timeout=12)
         if proposal is None or "error" in proposal:
