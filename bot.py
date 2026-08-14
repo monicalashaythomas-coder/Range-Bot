@@ -713,6 +713,8 @@ class DerivClient:
         self._inbox:      Optional[asyncio.Queue] = None
         self._send_task:  Optional[asyncio.Task]  = None
         self._recv_task:  Optional[asyncio.Task]  = None
+        self._req_id_counter: int  = 1
+        self._pending_requests: dict = {}
         self.initial_balance: float = 0.0
 
     def _rest_request(self, path: str, method: str = "GET") -> dict:
@@ -795,6 +797,13 @@ class DerivClient:
                 t.cancel()
         self._send_task = asyncio.create_task(self._send_pump(), name="send_pump")
         self._recv_task = asyncio.create_task(self._recv_pump(), name="recv_pump")
+        self._req_id_counter = 1
+        self._pending_requests: dict = {}  # req_id -> asyncio.Future
+
+    def _next_req_id(self) -> int:
+        rid = self._req_id_counter
+        self._req_id_counter += 1
+        return rid
 
     async def _send_pump(self):
         while True:
@@ -813,14 +822,60 @@ class DerivClient:
         try:
             async for raw in self.ws:
                 try:
-                    await self._inbox.put(json.loads(raw))
+                    msg = json.loads(raw)
                 except json.JSONDecodeError:
-                    pass
+                    continue
+                # Route by req_id if present — resolves a pending future
+                # directly rather than going into the shared inbox, which
+                # would get interleaved with ticks and consumed by the wrong
+                # concurrent gather task.
+                rid = msg.get("req_id")
+                if rid and rid in self._pending_requests:
+                    fut = self._pending_requests.pop(rid)
+                    if not fut.done():
+                        fut.set_result(msg)
+                else:
+                    await self._inbox.put(msg)
         except (ConnectionClosed, ConnectionClosedError, ConnectionClosedOK):
+            # Cancel all pending request futures
+            for fut in self._pending_requests.values():
+                if not fut.done():
+                    fut.cancel()
+            self._pending_requests.clear()
             await self._inbox.put({"__disconnect__": True})
         except Exception as exc:
             _log("RECV", f"Error: {exc}")
+            for fut in self._pending_requests.values():
+                if not fut.done():
+                    fut.cancel()
+            self._pending_requests.clear()
             await self._inbox.put({"__disconnect__": True})
+
+    async def send_with_id(self, data: dict, timeout: float = 12) -> Optional[dict]:
+        """
+        Sends a request with a unique req_id and awaits the response
+        directly via a Future, bypassing the shared inbox entirely.
+        This is how concurrent proposal fetches work correctly alongside
+        a continuous tick stream — each proposal gets its own Future,
+        matched by req_id when the response arrives.
+        """
+        loop = asyncio.get_event_loop()
+        rid  = self._next_req_id()
+        fut  = loop.create_future()
+        self._pending_requests[rid] = fut
+        data = dict(data)
+        data["req_id"] = rid
+        await self.send(data)
+        try:
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+        except asyncio.TimeoutError:
+            self._pending_requests.pop(rid, None)
+            if not fut.done():
+                fut.cancel()
+            return None
+        except asyncio.CancelledError:
+            self._pending_requests.pop(rid, None)
+            return None
 
     async def close(self):
         for t in (self._send_task, self._recv_task):
@@ -920,51 +975,35 @@ class DerivClient:
     async def _fetch_proposal_ratio(self, req: dict, label: str,
                                     p_win_mc: float) -> Optional[float]:
         """
-        Shared proposal fetch. Does NOT use receive_type("proposal") —
-        that helper re-queues non-matching messages and waits indefinitely
-        for exactly the right key, but the new Options API may return the
-        proposal wrapped differently. Instead, we read the next message
-        directly and log whatever keys actually arrive so we can diagnose
-        unexpected response shapes.
+        Sends a proposal request via send_with_id (req_id-matched routing)
+        so the response is delivered directly to a Future rather than
+        going into the shared inbox where it would be interleaved with
+        tick messages and consumed by the wrong concurrent gather task.
+
+        Also renames 'symbol' -> 'underlying_symbol' — the new Options
+        API renamed this field; sending 'symbol' returns
+        InputValidationFailed: Properties not allowed: symbol.
         """
-        await self.send(req)
-        try:
-            resp = await asyncio.wait_for(self._inbox.get(), timeout=12)
-        except asyncio.TimeoutError:
-            _log("QUOTE", f"{label}: TIMEOUT — no response in 12s. "
-                          "Check that this contract type / duration / symbol "
-                          "combination is valid on this account.")
-            return None
+        if "symbol" in req:
+            req["underlying_symbol"] = req.pop("symbol")
 
-        if not resp or "__disconnect__" in resp:
-            _log("QUOTE", f"{label}: disconnected mid-quote")
-            if resp:
-                await self._inbox.put(resp)
+        resp = await self.send_with_id(req, timeout=12)
+        if resp is None:
+            _log("QUOTE", f"{label}: TIMEOUT (12s)")
             return None
-
-        # Log full message keys so we can see what the API actually returns
-        top_keys = [k for k in resp.keys() if not k.startswith("__")]
         if "error" in resp:
             err = resp["error"]
-            _log("QUOTE", f"{label}: API error code={err.get('code','?')} "
-                          f"msg='{err.get('message','?')}'")
+            _log("QUOTE", f"{label}: {err.get('code','?')} — {err.get('message','?')}")
             return None
-
-        # Try "proposal" key (legacy + new API both use this in practice)
         data = resp.get("proposal", {})
         if not data:
-            _log("QUOTE", f"{label}: no 'proposal' key in response — "
-                          f"got keys={top_keys}. Full msg: {json.dumps(resp)[:300]}")
-            # Re-queue — might be a tick or other message the main loop needs
-            await self._inbox.put(resp)
+            _log("QUOTE", f"{label}: no 'proposal' key — keys={list(resp.keys())}")
             return None
-
         ask  = float(data.get("ask_price", 0))
         pout = float(data.get("payout", 0))
         if ask <= 0:
-            _log("QUOTE", f"{label}: ask_price=0 payout={pout} — skipping")
+            _log("QUOTE", f"{label}: ask_price=0")
             return None
-
         ratio = (pout - ask) / ask
         _log("QUOTE", f"{label}: p_mc={p_win_mc:.3f} ask={ask:.2f} "
                       f"payout={pout:.2f} ratio={ratio:.3f} "
@@ -979,19 +1018,18 @@ class DerivClient:
         contract_type = sig.contract_type
         half_width = (sig.barrier_high - sig.barrier_low) / 2
         req = {
-            "proposal":      1,
-            "amount":        sig.stake,
-            "basis":         "stake",
-            "contract_type": contract_type,
-            "currency":      self.cfg["currency"],
-            "duration":      sig.duration_s,
-            "duration_unit": "s",
-            "symbol":        sig.symbol,
-            "barrier":       f"+{half_width:.4f}",
-            "barrier2":      f"-{half_width:.4f}",
+            "proposal":           1,
+            "amount":             sig.stake,
+            "basis":              "stake",
+            "contract_type":      contract_type,
+            "currency":           self.cfg["currency"],
+            "duration":           sig.duration_s,
+            "duration_unit":      "s",
+            "underlying_symbol":  sig.symbol,
+            "barrier":            f"+{half_width:.4f}",
+            "barrier2":           f"-{half_width:.4f}",
         }
-        await self.send(req)
-        proposal = await self.receive_type("proposal", timeout=12)
+        proposal = await self.send_with_id(req, timeout=12)
         if proposal is None or "error" in proposal:
             err = (proposal or {}).get("error", {}).get("message", "timeout")
             _log("PROPOSAL", f"Error: {err}")
