@@ -136,18 +136,16 @@ CONFIG = {
     "currency":         "USD",
 
     # ── Barrier scan parameters ────────────────────────────────────
-    # Instead of fixed barriers, scan a range at trade time, fetch real
-    # Deriv quotes, and keep only barriers that return >= min_return AND
-    # where our MC p_win beats the implied breakeven by >= min_edge_margin.
-    #
-    # Barrier scan range: multiples of local σ×√T (expected move).
-    # Deriv's payout reflects their implied p_win — we look for barriers
-    # where our MC says p_win is meaningfully higher than their implied p_win.
-    "er_barrier_mults": [0.8, 1.0, 1.2, 1.5, 1.8, 2.2, 2.8, 3.5],
-    "nt_barrier_mults": [1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0],
-    "min_return":       _env("MIN_RETURN",  0.40),   # minimum 40% profit on win
-    "min_edge_margin":  _env("MIN_EDGE",    0.08),   # MC must beat Deriv implied p_win by 8%
-    "scan_top_k":       _env("SCAN_TOP_K",     5),   # quote this many candidates per type
+    # Multiples of σ×√T×price (expected absolute price move over duration).
+    # For 1HZ10V: sigma≈0.00002, √120≈10.95, price≈9527 → sigma_T≈2.09
+    # For 1HZ100V: sigma≈0.00018, √120≈10.95, price≈720 → sigma_T≈1.42
+    # Confirmed valid barrier from API testing: 1HZ10V ±1.60, 1HZ100V ±1.16
+    # These correspond roughly to 0.5-0.8× sigma_T, so scan that range.
+    "er_barrier_mults": [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00],
+    "nt_barrier_mults": [0.50, 0.60, 0.70, 0.80, 0.90, 1.00, 1.20, 1.50],
+    "min_return":       _env("MIN_RETURN",  0.40),
+    "min_edge_margin":  _env("MIN_EDGE",    0.08),
+    "scan_top_k":       _env("SCAN_TOP_K",     5),
 
     # ── Contract duration ─────────────────────────────────────────
     "duration_s":       120,   # 2 minutes in seconds
@@ -337,13 +335,14 @@ class TickStore:
 
 @dataclass
 class ContractSignal:
-    """Result of the full 5-layer intelligence evaluation for one contract type."""
-    contract_type:  str       # "EXPIRYRANGE" | "NOTOUCH" | "SKIP"
-    symbol:         str
-    barrier:        float     # absolute barrier offset (positive, upper)
-    p_win_mc:       float     # MC probability estimate
-    layer_score:    float     # weighted score from layers 1-4 (0-1)
-    reasons:        List[str]
+    """Result of the full layer evaluation for one contract type."""
+    contract_type:    str   # "EXPIRYRANGE" | "NOTOUCH" — the intended contract
+    symbol:           str
+    barrier:          float
+    p_win_mc:         float
+    layer_score:      float
+    reasons:          List[str]
+    passed_layers:    bool = False  # True = layers 1-4 passed, ready for barrier scan
 
 
 @dataclass
@@ -517,8 +516,9 @@ def evaluate_signal(ts: TickStore, cfg: dict,
     s2, r2 = _vol_score(ts, cfg["vol_window"], cfg["vol_skip_thresh"], contract_type)
     reasons.append(r2)
     if s2 == 0.0 and "skip" in r2:
-        return ContractSignal("SKIP", sym, 0.0, 0.0, 0.0,
-                              reasons + ["vol_skip triggered"])
+        return ContractSignal(contract_type, sym, 0.0, 0.0, 0.0,
+                              reasons + ["vol_skip triggered"],
+                              passed_layers=False)
 
     s3, r3 = _hurst_score(ts, cfg["hurst_window"], contract_type)
     reasons.append(r3)
@@ -529,8 +529,9 @@ def evaluate_signal(ts: TickStore, cfg: dict,
                                cfg["proximity_nt_gate"])
     reasons.append(r4)
     if s4 == 0.0 and "BLOCKED" in r4:
-        return ContractSignal("SKIP", sym, 0.0, 0.0, 0.0,
-                              reasons + ["proximity gate blocked"])
+        return ContractSignal(contract_type, sym, 0.0, 0.0, 0.0,
+                              reasons + ["proximity gate blocked"],
+                              passed_layers=False)
 
     layer_score = (WEIGHTS["momentum"]  * s1 +
                    WEIGHTS["vol"]       * s2 +
@@ -540,11 +541,13 @@ def evaluate_signal(ts: TickStore, cfg: dict,
                    f"(threshold={cfg['signal_threshold']:.2f})")
 
     if layer_score < cfg["signal_threshold"]:
-        return ContractSignal("SKIP", sym, 0.0, 0.0, layer_score,
-                              reasons + ["below signal threshold"])
+        return ContractSignal(contract_type, sym, 0.0, 0.0, layer_score,
+                              reasons + ["below signal threshold"],
+                              passed_layers=False)
 
-    # Layers passed — barrier and MC will be determined by quote scan
-    return ContractSignal("ACTIVE", sym, 0.0, 0.0, layer_score, reasons)
+    # Layers passed — barrier and MC determined by quote scan
+    return ContractSignal(contract_type, sym, 0.0, 0.0, layer_score, reasons,
+                          passed_layers=True)
 
 
 def mc_p_win_expiryrange(ts: TickStore, barrier: float, duration_s: int,
@@ -929,7 +932,9 @@ class DerivClient:
         mults       = (cfg["er_barrier_mults"] if contract_type == "EXPIRYRANGE"
                        else cfg["nt_barrier_mults"])
 
-        # Expected move used to scale barrier candidates
+        # Expected move in ABSOLUTE price units over the duration.
+        # σ is return-scale (relative), so multiply by current price
+        # to get price units. This is the right scale for barrier offsets.
         sigma_T  = sigma * math.sqrt(duration_s) * price
 
         # Build candidate barriers from sigma multiples
@@ -1331,22 +1336,23 @@ class RangeBot:
         print(f"SIGNAL  {sym}  {_ts()}")
         for sig_candidate, label in [(er_sig, "ER"), (nt_sig, "NT")]:
             if sig_candidate:
-                print(f"  [{label}] {sig_candidate.contract_type}  "
+                status = "ACTIVE" if sig_candidate.passed_layers else "SKIP"
+                print(f"  [{label}] {sig_candidate.contract_type} {status}  "
                       f"layer={sig_candidate.layer_score:.3f}")
                 for r in sig_candidate.reasons:
                     print(f"    · {r}")
 
         # Only proceed to barrier scan for contract types that passed layers 1-4
         active = [s for s in [er_sig, nt_sig]
-                  if s and s.contract_type == "ACTIVE"]
+                  if s and s.passed_layers]
 
         if not active:
             print(f"  → No trade (layers blocked)")
             print(f"{'='*60}")
             return
 
-        # Barrier scan: concurrent quote fetch + MC edge check for each
-        # active contract type. Run both concurrently if both passed.
+        # Barrier scan: concurrent quote fetch + MC edge check
+        # s.contract_type is "EXPIRYRANGE" or "NOTOUCH" — the real type
         scan_tasks = [
             self.client.scan_barriers(s.contract_type, sym, ts, self.cfg)
             for s in active
