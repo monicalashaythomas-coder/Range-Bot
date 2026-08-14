@@ -940,37 +940,42 @@ class DerivClient:
                              stake: float) -> Optional[float]:
         half_width = (cand.barrier_high - cand.barrier_low) / 2
         req = {
-            "proposal":      1,
-            "amount":        stake,
-            "basis":         "stake",
-            "contract_type": "EXPIRYRANGE",
-            "currency":      self.cfg["currency"],
-            "duration":      cand.duration_s,
-            "duration_unit": "s",
-            "symbol":        symbol,
-            "barrier":       f"+{half_width:.4f}",
-            "barrier2":      f"-{half_width:.4f}",
+            "proposal":           1,
+            "amount":             stake,
+            "basis":              "stake",
+            "contract_type":      "EXPIRYRANGE",
+            "currency":           self.cfg["currency"],
+            "duration":           cand.duration_s,
+            "duration_unit":      "s",
+            "underlying_symbol":  symbol,
+            "barrier":            f"+{half_width:.2f}",   # max 2 decimal places
+            "barrier2":           f"-{half_width:.2f}",
         }
         return await self._fetch_proposal_ratio(
-            req, f"EXPIRYRANGE {symbol} {cand.duration_s}s ±{half_width:.4f}", cand.p_win_mc)
+            req, f"EXPIRYRANGE {symbol} {cand.duration_s}s ±{half_width:.2f}", cand.p_win_mc)
 
     async def fetch_nt_quote(self, symbol: str, cand: NTCandidate,
                              stake: float) -> Optional[float]:
         half_dist = cand.barrier_dist
+        single = self.cfg.get(f"{symbol}_nt_single_barrier", False)
         req = {
-            "proposal":      1,
-            "amount":        stake,
-            "basis":         "stake",
-            "contract_type": "NOTOUCH",
-            "currency":      self.cfg["currency"],
-            "duration":      cand.duration_s,
-            "duration_unit": "s",
-            "symbol":        symbol,
-            "barrier":       f"+{half_dist:.4f}",
-            "barrier2":      f"-{half_dist:.4f}",
+            "proposal":           1,
+            "amount":             stake,
+            "basis":              "stake",
+            "contract_type":      "NOTOUCH",
+            "currency":           self.cfg["currency"],
+            "duration":           cand.duration_s,
+            "duration_unit":      "s",
+            "underlying_symbol":  symbol,
         }
+        if single:
+            # Single barrier NOTOUCH — use upper barrier only (price stays below)
+            req["barrier"] = f"+{half_dist:.2f}"
+        else:
+            req["barrier"]  = f"+{half_dist:.2f}"
+            req["barrier2"] = f"-{half_dist:.2f}"
         return await self._fetch_proposal_ratio(
-            req, f"NOTOUCH {symbol} {cand.duration_s}s ±{half_dist:.4f}", cand.p_win_mc)
+            req, f"NOTOUCH {symbol} {cand.duration_s}s ±{half_dist:.2f}", cand.p_win_mc)
 
     async def _fetch_proposal_ratio(self, req: dict, label: str,
                                     p_win_mc: float) -> Optional[float]:
@@ -1026,9 +1031,14 @@ class DerivClient:
             "duration":           sig.duration_s,
             "duration_unit":      "s",
             "underlying_symbol":  sig.symbol,
-            "barrier":            f"+{half_width:.4f}",
-            "barrier2":           f"-{half_width:.4f}",
+            "barrier":            f"+{half_width:.2f}",
         }
+        if contract_type == "EXPIRYRANGE":
+            req["barrier2"] = f"-{half_width:.2f}"
+        elif contract_type == "NOTOUCH":
+            if not self.cfg.get(f"{sig.symbol}_nt_single_barrier", False):
+                req["barrier2"] = f"-{half_width:.2f}"
+
         proposal = await self.send_with_id(req, timeout=12)
         if proposal is None or "error" in proposal:
             err = (proposal or {}).get("error", {}).get("message", "timeout")
@@ -1141,6 +1151,92 @@ class RangeBot:
         self._stop:              bool          = False
         self._last_persist:      float         = 0.0
 
+    # ── Contract spec discovery ───────────────────────────────────────────────
+
+    async def _discover_contracts(self, symbol: str):
+        """
+        Calls contracts_for to discover valid durations, barrier types, and
+        barrier count for EXPIRYRANGE and NOTOUCH on this symbol. Updates
+        the config live so the MC scanners and quote fetchers use values
+        that Deriv will actually accept — rather than hand-tuned guesses
+        that produce ContractBuyValidationError or InvalidBarrierSingle.
+        """
+        resp = await self.client.send_with_id(
+            {"contracts_for": symbol, "currency": self.cfg["currency"],
+             "landing_company": "svg"}, timeout=15
+        )
+        if not resp or "error" in resp:
+            _log("CONTRACTS", f"{symbol}: could not fetch contracts_for — "
+                              f"using config defaults")
+            return
+
+        available = resp.get("contracts_for", {}).get("available", [])
+        if not available:
+            _log("CONTRACTS", f"{symbol}: empty available list")
+            return
+
+        er_durations_s, nt_durations_s = set(), set()
+        nt_single_barrier = False
+
+        for c in available:
+            ct = c.get("contract_type", "")
+            # Duration info
+            min_d = c.get("min_contract_duration", "")
+            max_d = c.get("max_contract_duration", "")
+
+            def parse_dur_s(d: str) -> Optional[int]:
+                if not d:
+                    return None
+                try:
+                    if d.endswith("t"):
+                        return int(d[:-1])      # ticks — treat as seconds for 1Hz
+                    elif d.endswith("s"):
+                        return int(d[:-1])
+                    elif d.endswith("m"):
+                        return int(d[:-1]) * 60
+                    elif d.endswith("h"):
+                        return int(d[:-1]) * 3600
+                    return int(d)
+                except (ValueError, IndexError):
+                    return None
+
+            min_s = parse_dur_s(min_d)
+            max_s = parse_dur_s(max_d)
+
+            barrier_cat = c.get("barrier_category", "")
+
+            if ct == "EXPIRYRANGE" and min_s and max_s:
+                # Generate candidate durations between min and max
+                for t in [5, 10, 15, 30, 60, 120, 300, 600]:
+                    if min_s <= t <= max_s:
+                        er_durations_s.add(t)
+
+            if ct == "NOTOUCH" and min_s and max_s:
+                for t in [5, 10, 15, 30, 60, 120, 300]:
+                    if min_s <= t <= max_s:
+                        nt_durations_s.add(t)
+                # single barrier if category is non-euro/american
+                if barrier_cat in ("non_euro_american", "euro_non_atm"):
+                    nt_single_barrier = True
+
+        if er_durations_s:
+            self.cfg[f"{symbol}_er_durations"] = sorted(er_durations_s)
+            _log("CONTRACTS", f"{symbol} EXPIRYRANGE durations: "
+                              f"{sorted(er_durations_s)}s")
+        else:
+            _log("CONTRACTS", f"{symbol}: no EXPIRYRANGE durations found — "
+                              f"using defaults {self.cfg['er_durations']}")
+
+        if nt_durations_s:
+            self.cfg[f"{symbol}_nt_durations"] = sorted(nt_durations_s)
+            _log("CONTRACTS", f"{symbol} NOTOUCH durations: "
+                              f"{sorted(nt_durations_s)}s  single_barrier={nt_single_barrier}")
+        else:
+            _log("CONTRACTS", f"{symbol}: no NOTOUCH durations found — "
+                              f"using defaults {self.cfg['nt_durations']}")
+
+        self.cfg[f"{symbol}_nt_single_barrier"] = nt_single_barrier
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _is_settled(self, data: dict) -> bool:
@@ -1238,14 +1334,20 @@ class RangeBot:
                         min(self.balance * 0.02, self.balance * self.cfg["max_stake_pct"]))
         est_stake = round(est_stake, 2)
 
-        # MC scans
+        # MC scans — use discovered durations if available, else config defaults
         er_cands: List[ERCandidate] = []
         nt_cands: List[NTCandidate] = []
+        er_durs = self.cfg.get(f"{sym}_er_durations", self.cfg["er_durations"])
+        nt_durs = self.cfg.get(f"{sym}_nt_durations", self.cfg["nt_durations"])
+
+        scan_cfg = dict(self.cfg)
+        scan_cfg["er_durations"] = er_durs
+        scan_cfg["nt_durations"] = nt_durs
 
         if mode in ("both", "expiryrange"):
-            er_cands = mc_scan_expiryrange(ts, self.cfg)
+            er_cands = mc_scan_expiryrange(ts, scan_cfg)
         if mode in ("both", "notouch"):
-            nt_cands = mc_scan_notouch(ts, self.cfg)
+            nt_cands = mc_scan_notouch(ts, scan_cfg)
 
         if not er_cands and not nt_cands:
             _log(sym, "No MC candidates generated — skipping")
@@ -1421,6 +1523,11 @@ class RangeBot:
         # Warm-start persisted stats
         for sym, st in self.states.items():
             self.store.load_symbol_stats(sym, st.engine)
+
+        # Discover valid contract specs from Deriv before trading
+        _log("BOT", "Discovering valid contract specs from Deriv...")
+        for sym in self.symbols:
+            await self._discover_contracts(sym)
 
         # Subscribe to all symbols
         for sym in self.symbols:
