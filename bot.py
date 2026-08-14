@@ -1390,9 +1390,8 @@ class RangeBot:
         print(f"{'='*60}")
         print(f"  Symbols  : {', '.join(self.symbols)}")
         print(f"  Contracts: EXPIRYRANGE + NOTOUCH (mode={self.cfg['contract_mode']})")
-        print(f"  Min stake: ${self.cfg['min_stake']:.2f}  "
-              f"Max stake: {self.cfg['max_stake_pct']:.0%} of balance")
-        print(f"  Kelly    : {self.cfg['kelly_fraction']:.0%} fractional")
+        print(f"  Stake    : ${self.cfg['stake']:.2f} flat  "
+              f"(max ${self.cfg['max_stake']:.2f})")
         print(f"  Stop-loss: ${self.cfg['stop_loss']:.2f}")
         print(f"  Cooldown : {self.cfg['eval_cooldown']}s between evals per symbol")
         print(f"{'='*60}\n")
