@@ -1,66 +1,81 @@
 """
-DERIV EXPIRYRANGE + NOTOUCH BOT
-================================
-Symbols  : 1HZ10V  (Volatility 10 Index — 1-second feed)
-           1HZ100V (Volatility 100 Index — 1-second feed)
-Contracts: EXPIRYRANGE — price must fall WITHIN barriers at expiry tick
-           NOTOUCH     — price must NEVER touch either barrier during hold
+DERIV EXPIRYRANGE + NOTOUCH BOT  v2
+====================================
+Symbols  : 1HZ10V  (Volatility 10 Index)
+           1HZ100V (Volatility 100 Index)
+Contracts: EXPIRYRANGE — terminal price must land WITHIN fixed barriers at expiry
+           NOTOUCH     — price must NEVER touch the upper barrier during hold
 
-Signal architecture
-───────────────────
-  EXPIRYRANGE and NOTOUCH are both non-directional volatility products:
-  you are not betting which way price moves, you are betting HOW MUCH it
-  moves. The signal stack is therefore entirely different from the Rise/Fall
-  bot — no bias, markov, or momentum layers. Instead:
+Fixed barriers (2-minute expiry, from live testing):
+  1HZ10V  EXPIRYRANGE : ±1.60 price units
+  1HZ10V  NOTOUCH     : +1.70 price units (upper barrier only)
+  1HZ100V EXPIRYRANGE : ±1.16 price units
+  1HZ100V NOTOUCH     : +1.16 price units (upper barrier only)
 
-  LAYER 1 — Volatility regime (σ estimate from recent returns)
-    · Local σ from last 50 returns (return-scale, scale-invariant)
-    · Low vol  → EXPIRYRANGE favoured (price likely stays contained)
-    · High vol → NOTOUCH favoured (barriers likely untouched if wide enough)
-    · Very high vol → skip both (chaotic, barrier pricing unreliable)
+Signal philosophy
+─────────────────
+  We do NOT scan for the best EV across a grid of barriers.
+  The barriers are fixed. The only question is: does the market,
+  RIGHT NOW, give us enough confidence that price will behave as
+  required over the next 2 minutes?
 
-  LAYER 2 — Hurst exponent (mean-reversion vs trending)
-    · H < 0.45 → mean-reverting → EXPIRYRANGE more attractive
-      (price oscillates back toward centre, unlikely to end far out)
-    · H > 0.55 → trending → NOTOUCH more attractive
-      (trending price less likely to touch distant barriers)
-    · 0.45 ≤ H ≤ 0.55 → near-random walk → use vol regime only
+  Five intelligence layers must reach agreement before a trade fires.
+  Layers are evaluated per-contract-type — EXPIRYRANGE and NOTOUCH
+  have different requirements because they measure different things
+  (terminal containment vs path non-touch):
 
-  LAYER 3 — Monte Carlo terminal distribution (EXPIRYRANGE)
-    · Simulates N terminal prices via GBM closed-form draws
-    · For each (barrier_width, duration) candidate, estimates
-      P(barrier_low < terminal_price < barrier_high)
-    · Compares against real payout quote from Deriv to get true EV
-    · Selects (width, duration) maximising EV
+  LAYER 1 — Momentum direction (last 5 and 20 ticks)
+    · Short momentum (5-tick): direction and magnitude of recent move
+    · Medium momentum (20-tick): whether momentum is sustained
+    · EXPIRYRANGE: wants LOW momentum in both windows (price is drifting,
+      not running — a price that is running is likely to exit barriers)
+    · NOTOUCH: wants price MOVING AWAY from the upper barrier — downward
+      or flat momentum is bullish for a NOTOUCH upper barrier bet
 
-  LAYER 4 — Monte Carlo path simulation (NOTOUCH)
-    · Simulates full tick-by-tick paths for each (barrier_dist, duration)
-    · Estimates P(price never touches either barrier throughout hold)
-    · Compares against real payout quote from Deriv to get true EV
-    · Selects (dist, duration) maximising EV
+  LAYER 2 — Volatility level (σ from last 60 ticks)
+    · EXPIRYRANGE: low σ strongly favours containment (±1.6 is wide
+      relative to the expected move if vol is low)
+    · NOTOUCH: moderate vol is acceptable if momentum is downward;
+      very high vol makes upper barrier touch more likely
 
-  LAYER 5 — Contract type selector
-    · Runs both EXPIRYRANGE and NOTOUCH scans when vol/Hurst are ambiguous
-    · Picks whichever contract type + parameters produces the highest
-      real EV (using live Deriv quotes, not assumed payouts)
-    · Falls back to EXPIRYRANGE-only in low-vol regimes,
-      NOTOUCH-only in trending high-vol regimes
+  LAYER 3 — Hurst exponent (mean-reversion vs trend, last 80 ticks)
+    · EXPIRYRANGE: H < 0.50 (mean-reverting) strongly favoured —
+      price is likely to oscillate back to centre, not drift to edges
+    · NOTOUCH: H > 0.50 (trending) favoured when price is trending
+      downward; OR H < 0.45 (strong mean-reversion) also works because
+      a mean-reverting market is unlikely to make a sustained run to touch
+
+  LAYER 4 — Recent price level vs upper barrier
+    · How far is current price from the upper barrier?
+    · NOTOUCH: the closer price is to the barrier, the higher the
+      touch risk — gate blocks if price is already within 40% of
+      the barrier distance from above
+    · EXPIRYRANGE: symmetric, so gate checks that price is near
+      the centre of the range, not already pushed to one edge
+
+  LAYER 5 — Monte Carlo path/terminal simulation
+    · EXPIRYRANGE: draws N terminal prices from GBM(µ, σ, T=120s)
+      P(|terminal - entry| < barrier) is the direct estimate
+    · NOTOUCH: simulates N full tick-by-tick paths
+      P(max(price) < entry + barrier throughout 120s) is the estimate
+    · Both must clear MIN_MC_CONFIDENCE threshold
+    · MC is the final arbiter — all other layers passing but MC
+      saying P(win) < threshold → no trade
+
+  AGREEMENT LOGIC:
+    · Each layer votes pass/fail with a confidence weight
+    · Total weighted score must exceed SIGNAL_THRESHOLD
+    · MC confidence must independently exceed MIN_MC_CONFIDENCE
+    · Both conditions must hold simultaneously
 
 Risk management
 ───────────────
-  · No martingale — EXPIRYRANGE/NOTOUCH losses don't invert on the next
-    trade (there's no directional signal to double down on). Instead:
-    flat staking with per-symbol daily loss limits.
-  · Balance-aware position sizing: stake = Kelly fraction × balance,
-    capped at MAX_STAKE_PCT per trade. Kelly fraction = (p_win × r - (1-p_win)) / r
-    where r = payout_ratio (net profit ratio from live quote).
-  · Per-symbol loss circuit breaker: N consecutive losses → pause M seconds.
-  · Session stop-loss and take-profit (flat $ or % of session-start balance).
+  · Flat stake per trade (configurable), not Kelly
+    (payout ratios are too thin for Kelly to size meaningfully)
+  · Per-symbol consecutive loss circuit breaker
+  · Session stop-loss
 
-Connection layer
-────────────────
-  Deriv new Options API — REST OTP bootstrap + WebSocket, identical to the
-  PR05 bot. No legacy app_id query param, no in-band authorize message.
+Connection: Deriv new Options API (REST OTP + WebSocket)
 """
 
 import asyncio
@@ -117,76 +132,77 @@ CONFIG = {
     "use_real_account": _env("DERIV_USE_REAL", False),
 
     # ── Symbols ───────────────────────────────────────────────────
-    # Both are traded concurrently on the same WebSocket connection.
     "symbols":          ["1HZ10V", "1HZ100V"],
     "currency":         "USD",
 
-    # ── Contract types per symbol ─────────────────────────────────
-    # "both" → scan EXPIRYRANGE and NOTOUCH each cycle, pick best EV
-    # "expiryrange" → EXPIRYRANGE only
-    # "notouch"     → NOTOUCH only
+    # ── Fixed barriers (confirmed from live API testing) ──────────
+    # These are the known-valid barrier sizes for 2-minute expiry.
+    # We do not scan for barriers — they are fixed. The signal layers
+    # decide whether market conditions justify trading them.
+    "barriers": {
+        "1HZ10V":  {"er": 1.60, "nt": 1.70},
+        "1HZ100V": {"er": 1.16, "nt": 1.16},
+    },
+
+    # ── Contract duration ─────────────────────────────────────────
+    "duration_s":       120,   # 2 minutes in seconds
+    "duration_unit":    "s",
+
+    # ── Tick history ──────────────────────────────────────────────
+    "tick_window":      300,   # keep last 300 ticks (5 minutes)
+    "min_ticks":        90,    # minimum before evaluating (1.5 min warmup)
+
+    # ── Signal layer parameters ───────────────────────────────────
+    # Layer 1: Momentum
+    "momentum_short_n":   5,    # short momentum window (ticks)
+    "momentum_medium_n":  20,   # medium momentum window (ticks)
+    # Layer 2: Volatility
+    "vol_window":         60,   # ticks for σ estimate
+    # How many ticks does price typically move in 120 seconds at this vol?
+    # Expected move = σ × √120. Barrier must be > expected move for EXPIRYRANGE
+    # to be reasonable, and barrier must be comfortably above expected max excursion
+    # for NOTOUCH. These ratios gate signal confidence.
+    "vol_skip_thresh":    _env("VOL_SKIP", 0.000300),   # skip if chaos
+    # Layer 3: Hurst
+    "hurst_window":       80,
+    # Layer 4: Barrier proximity
+    "nt_proximity_gate":  0.40,  # skip NOTOUCH if price is within 40% of barrier
+    "er_centre_gate":     0.65,  # skip EXPIRYRANGE if price moved >65% of barrier from centre
+    # Layer 5: Monte Carlo
+    "mc_n_sims":          2000,
+    "mc_min_confidence":  _env("MC_MIN_CONF", 0.72),  # MC p(win) must exceed this
+
+    # ── Signal agreement threshold ────────────────────────────────
+    # Weighted vote from layers 1-4 must exceed this before MC is even run.
+    # Scale: 0.0 (no agreement) to 1.0 (all layers fully agree)
+    "signal_threshold":   _env("SIGNAL_THRESH", 0.60),
+
+    # ── Contract mode ─────────────────────────────────────────────
+    # "both" → evaluate EXPIRYRANGE and NOTOUCH each cycle, pick best MC score
+    # "expiryrange" → only EXPIRYRANGE
+    # "notouch"     → only NOTOUCH
     "contract_mode":    _env("CONTRACT_MODE", "both"),
 
-    # ── Tick history window ───────────────────────────────────────
-    "tick_window":      _env("TICK_WINDOW",    200),   # ticks kept per symbol
-    "min_ticks":        _env("MIN_TICKS",       60),   # minimum before evaluating
+    # ── Stake sizing ─────────────────────────────────────────────
+    # Flat stake — not Kelly (payouts are too thin for Kelly to be meaningful)
+    "stake":            _env("STAKE", 1.00),
+    "max_stake":        _env("MAX_STAKE", 50.00),
 
-    # ── Volatility regime ─────────────────────────────────────────
-    # Return-scale (scale-invariant). Based on empirical 1HZ10V/1HZ100V
-    # tick behaviour: 1HZ10V is much lower vol than 1HZ100V.
-    # These defaults work for both; tune per-symbol via env vars.
-    "vol_low_thresh":   _env("VOL_LOW",   0.000015),  # below → low-vol / EXPIRYRANGE regime
-    "vol_high_thresh":  _env("VOL_HIGH",  0.000120),  # above → high-vol / NOTOUCH regime
-    "vol_skip_thresh":  _env("VOL_SKIP",  0.000300),  # above → skip (chaotic)
-    "vol_window":       _env("VOL_WINDOW",      50),  # returns to use for σ estimate
-
-    # ── Hurst exponent ────────────────────────────────────────────
-    "hurst_window":     _env("HURST_WINDOW",    80),  # ticks for Hurst calculation
-    "hurst_mr_thresh":  _env("HURST_MR",      0.45),  # below → mean-reverting
-    "hurst_tr_thresh":  _env("HURST_TR",      0.55),  # above → trending
-
-    # ── EXPIRYRANGE ───────────────────────────────────────────────
-    # Valid durations confirmed from live API testing.
-    # Min 2 minutes, max 15 minutes as per trading requirements.
-    "er_durations":     [120, 180, 300, 600, 900],  # seconds (2m,3m,5m,10m,15m)
-    "er_sigma_mults":   [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5],
-    "er_n_sims":        _env("ER_SIMS",    1000),
-    "er_top_k":         _env("ER_TOP_K",      6),
-    "er_min_ev":        _env("ER_MIN_EV",  0.02),
-
-    # ── NOTOUCH ───────────────────────────────────────────────────
-    # Single barrier only on 1HZ synthetic indices — price must NOT
-    # touch the barrier above current spot. Upper barrier (+offset) only.
-    "nt_single_barrier": True,
-    "nt_sigma_mults":   [1.5, 2.0, 2.5, 3.0, 3.5, 4.0],
-    "nt_durations":     [120, 180, 300, 600, 900],  # seconds (2m–15m)
-    "nt_n_sims":        _env("NT_SIMS",    1000),
-    "nt_top_k":         _env("NT_TOP_K",      6),
-    "nt_min_ev":        _env("NT_MIN_EV",  0.02),
-
-    # ── Kelly stake sizing ────────────────────────────────────────
-    "kelly_fraction":   _env("KELLY_FRAC",   0.25),  # quarter-Kelly (conservative)
-    "min_stake":        _env("MIN_STAKE",    1.00),
-    "max_stake_pct":    _env("MAX_STAKE_PCT", 0.02), # max 2% of balance per trade
-
-    # ── Session risk limits ───────────────────────────────────────
-    "target_profit":     _env("TARGET_PROFIT",   0.0),   # 0 = disabled
-    "stop_loss":          _env("STOP_LOSS",      20.0),
-    "target_profit_pct": _env("TARGET_PCT",      0.0),
-    "stop_loss_pct":      _env("STOP_PCT",        0.0),
+    # ── Session risk ──────────────────────────────────────────────
+    "stop_loss":        _env("STOP_LOSS", 20.00),
+    "stop_loss_pct":    _env("STOP_PCT",   0.0),
 
     # ── Circuit breaker ───────────────────────────────────────────
     "consec_loss_limit": _env("CONSEC_LOSS_LIMIT",    3),
     "consec_pause_secs": _env("CONSEC_PAUSE_SECS",  300),
 
-    # ── Evaluation pacing ─────────────────────────────────────────
-    # Minimum seconds between evaluations on the same symbol.
-    # EXPIRYRANGE/NOTOUCH scanning involves real proposal round-trips —
-    # don't hammer the API on every tick.
-    "eval_cooldown":    _env("EVAL_COOLDOWN",   30),   # seconds between evals per symbol
+    # ── Eval cooldown ─────────────────────────────────────────────
+    # Minimum seconds between evaluations per symbol.
+    # Given 2-minute contracts, no point evaluating faster than every 30s.
+    "eval_cooldown":    _env("EVAL_COOLDOWN", 30),
 
     # ── Resilience ────────────────────────────────────────────────
-    "lock_timeout":         _env("LOCK_TIMEOUT",     600),  # seconds (long contracts)
+    "lock_timeout":         _env("LOCK_TIMEOUT",     240),  # 2min contract + 2min buffer
     "buy_recv_retries":     _env("BUY_RETRIES",        8),
     "reconnect_delay_min":  _env("RECONNECT_MIN",       2),
     "reconnect_delay_max":  _env("RECONNECT_MAX",      60),
@@ -194,7 +210,7 @@ CONFIG = {
     "orphan_poll_attempts": _env("ORPHAN_ATTEMPTS",     4),
     "orphan_poll_interval": _env("ORPHAN_INTERVAL",     3),
 
-    # ── Persistence (optional) ────────────────────────────────────
+    # ── Persistence ───────────────────────────────────────────────
     "supabase_url":      _env("SUPABASE_URL", ""),
     "supabase_key":      _env("SUPABASE_KEY", ""),
     "persist_every_secs": _env("PERSIST_EVERY_SECS", 120),
@@ -305,332 +321,344 @@ class TickStore:
 
 
 # ============================================================================
-# VOL REGIME
-# ============================================================================
-
-class VolRegime(Enum):
-    LOW      = "low"       # EXPIRYRANGE favoured
-    MID      = "mid"       # evaluate both, pick best EV
-    HIGH     = "high"      # NOTOUCH favoured
-    SKIP     = "skip"      # too chaotic, skip this cycle
-
-
-def classify_regime(sigma: float, cfg: dict) -> VolRegime:
-    if sigma <= 0 or sigma >= cfg["vol_skip_thresh"]:
-        return VolRegime.SKIP
-    if sigma < cfg["vol_low_thresh"]:
-        return VolRegime.LOW
-    if sigma > cfg["vol_high_thresh"]:
-        return VolRegime.HIGH
-    return VolRegime.MID
-
-
-# ============================================================================
-# MONTE CARLO — EXPIRYRANGE
+# SIGNAL ENGINE — 5-layer intelligence for fixed-barrier contracts
 # ============================================================================
 
 @dataclass
-class ERCandidate:
-    duration_s:  int      # duration in seconds (= ticks for 1Hz)
-    sigma_mult:  float    # barrier half-width = sigma_mult × σ × √T
-    barrier_half: float   # absolute half-width in price units
-    p_win_mc:    float    # P(terminal price within barriers) from MC
-    ev:          float    # filled in after real quote fetch
-    payout_ratio: float   # filled in after real quote fetch
-    barrier_low:  float   # absolute price levels
-    barrier_high: float
+class ContractSignal:
+    """Result of the full 5-layer intelligence evaluation for one contract type."""
+    contract_type:  str       # "EXPIRYRANGE" | "NOTOUCH" | "SKIP"
+    symbol:         str
+    barrier:        float     # absolute barrier offset (positive, upper)
+    p_win_mc:       float     # MC probability estimate
+    layer_score:    float     # weighted score from layers 1-4 (0-1)
+    reasons:        List[str]
 
-
-def mc_scan_expiryrange(ts: TickStore, cfg: dict) -> List[ERCandidate]:
-    """
-    For each (sigma_mult, duration) candidate, compute P(win) using
-    closed-form GBM terminal distribution (no step-by-step simulation
-    needed for EXPIRYRANGE since only the terminal price matters).
-
-    Terminal log-price relative to current follows:
-        X_T ~ N((µ - σ²/2)·T, σ²·T)
-    so P(low < S_T < high) is just the difference of two Normal CDFs.
-    We draw N samples directly from this distribution rather than using
-    scipy/numpy (no extra dependencies) via Box-Muller.
-    """
-    price = ts.current_price()
-    if price is None or price <= 0:
-        return []
-
-    sigma    = ts.local_vol(cfg["vol_window"])
-    mu       = ts.local_drift(cfg["vol_window"])
-    n_sims   = cfg["er_n_sims"]
-    if sigma <= 0:
-        return []
-
-    candidates: List[ERCandidate] = []
-
-    for T in cfg["er_durations"]:
-        # GBM parameters over T ticks (ticks = seconds for 1Hz symbols)
-        mu_T    = (mu - 0.5 * sigma**2) * T
-        sigma_T = sigma * math.sqrt(T)
-
-        # Draw N terminal log-returns from N(mu_T, sigma_T²)
-        log_rets = []
-        for _ in range(n_sims):
-            u1 = random.random() or 1e-15
-            u2 = random.random() or 1e-15
-            z  = math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2)
-            log_rets.append(mu_T + sigma_T * z)
-
-        for mult in cfg["er_sigma_mults"]:
-            # Barrier half-width in log-price space (symmetric around centre)
-            hw_log = mult * sigma_T
-            # Convert to price: barrier_half ≈ price × hw_log for small hw
-            hw_price = price * (math.exp(hw_log) - 1)
-            b_low  = price - hw_price
-            b_high = price + hw_price
-            if b_low <= 0:
-                continue
-
-            # P(win) = fraction of terminal prices within barriers
-            wins = sum(1 for lr in log_rets
-                       if b_low <= price * math.exp(lr) <= b_high)
-            p_win = wins / n_sims
-
-            candidates.append(ERCandidate(
-                duration_s=T, sigma_mult=mult,
-                barrier_half=hw_price,
-                p_win_mc=p_win,
-                ev=0.0, payout_ratio=0.0,
-                barrier_low=b_low, barrier_high=b_high,
-            ))
-
-    # Pre-rank by MC p_win × expected payout proxy (higher p_win ranks lower
-    # payout from Deriv, so balance the two) — send the top-K for real quoting.
-    # Rough proxy: payout ~ 1/p_win (fair pricing), so EV proxy ~ p_win × (1/p_win) - 1 = 0
-    # for fair. We instead rank by distance from breakeven: abs(p_win - 0.5)
-    # is NOT what we want — we want the candidates Deriv will overprice.
-    # Since we don't know that yet, rank by p_win in descending order and
-    # let the real quote fetch determine actual EV.
-    candidates.sort(key=lambda c: -c.p_win_mc)
-    return candidates[:cfg["er_top_k"]]
-
-
-# ============================================================================
-# MONTE CARLO — NOTOUCH
-# ============================================================================
-
-@dataclass
-class NTCandidate:
-    duration_s:   int
-    sigma_mult:   float
-    barrier_dist: float   # absolute distance from current price to each barrier
-    p_win_mc:     float   # P(never touches either barrier)
-    ev:           float
-    payout_ratio: float
-    barrier_low:  float
-    barrier_high: float
-
-
-def mc_scan_notouch(ts: TickStore, cfg: dict) -> List[NTCandidate]:
-    """
-    NOTOUCH requires simulating the full path, not just the terminal price
-    — any touch of either barrier during the hold loses, regardless of
-    where the price ends up. We simulate tick-by-tick GBM paths using
-    the Euler-Maruyama scheme:
-        S_{t+1} = S_t × exp((µ - σ²/2)·dt + σ·ε)
-    where dt=1 tick. This is slower than closed-form but necessary here.
-
-    To keep CPU usage reasonable, NOTOUCH uses a slightly smaller default
-    n_sims than EXPIRYRANGE (1000 vs 1000 — same default, but the loop is
-    longer per sim due to path tracking). Reduce NT_SIMS in Railway
-    Variables if evaluation latency becomes an issue.
-    """
-    price = ts.current_price()
-    if price is None or price <= 0:
-        return []
-
-    sigma  = ts.local_vol(cfg["vol_window"])
-    mu     = ts.local_drift(cfg["vol_window"])
-    n_sims = cfg["nt_n_sims"]
-    if sigma <= 0:
-        return []
-
-    # Pre-generate Gaussian noise for all paths at once (Box-Muller)
-    # to avoid re-generating per (duration, mult) combination.
-    max_T = max(cfg["nt_durations"])
-    epsilons: List[List[float]] = []
-    for _ in range(n_sims):
-        path_eps = []
-        for _ in range(max_T):
-            u1 = random.random() or 1e-15
-            u2 = random.random() or 1e-15
-            path_eps.append(math.sqrt(-2*math.log(u1)) * math.cos(2*math.pi*u2))
-        epsilons.append(path_eps)
-
-    candidates: List[NTCandidate] = []
-
-    for T in cfg["nt_durations"]:
-        sigma_T = sigma * math.sqrt(T)
-
-        for mult in cfg["nt_sigma_mults"]:
-            dist    = mult * sigma_T * price   # absolute barrier distance
-            b_low   = price - dist
-            b_high  = price + dist
-            if b_low <= 0:
-                continue
-
-            wins = 0
-            drift_per_tick = mu - 0.5 * sigma**2
-            for path_eps in epsilons:
-                s = price
-                touched = False
-                for t in range(T):
-                    s = s * math.exp(drift_per_tick + sigma * path_eps[t])
-                    if s <= b_low or s >= b_high:
-                        touched = True
-                        break
-                if not touched:
-                    wins += 1
-
-            p_win = wins / n_sims
-            candidates.append(NTCandidate(
-                duration_s=T, sigma_mult=mult,
-                barrier_dist=dist,
-                p_win_mc=p_win,
-                ev=0.0, payout_ratio=0.0,
-                barrier_low=b_low, barrier_high=b_high,
-            ))
-
-    candidates.sort(key=lambda c: -c.p_win_mc)
-    return candidates[:cfg["nt_top_k"]]
-
-
-# ============================================================================
-# SIGNAL ENGINE
-# ============================================================================
 
 @dataclass
 class TradeSignal:
-    contract_type: str        # "EXPIRYRANGE" | "NOTOUCH" | "SKIP"
-    symbol:        str
-    duration_s:    int        # duration in seconds
-    barrier_low:   float
-    barrier_high:  float
-    p_win_mc:      float      # MC estimate
-    payout_ratio:  float      # from live Deriv quote
-    ev:            float      # final EV after real quote
-    stake:         float
-    reasons:       List[str] = field(default_factory=list)
+    """Resolved trade instruction passed to place_trade()."""
+    contract_type:  str
+    symbol:         str
+    barrier:        float     # absolute barrier offset (+)
+    p_win_mc:       float
+    layer_score:    float
+    stake:          float
+    reasons:        List[str] = field(default_factory=list)
 
 
-class SignalEngine:
+def _momentum_score(ts: TickStore, short_n: int, medium_n: int,
+                    contract_type: str) -> Tuple[float, str]:
     """
-    Per-symbol signal evaluation. Combines the vol regime, Hurst estimate,
-    and both MC scanners to produce a TradeSignal with the best EV available
-    this cycle, or a SKIP signal if nothing clears the minimum EV threshold.
+    Layer 1 — Momentum.
+
+    For EXPIRYRANGE: we want LOW momentum in both windows. Price that is
+    moving strongly in any direction is more likely to exit the range.
+    Score = 1.0 when momentum is near-zero, 0.0 when it's large.
+
+    For NOTOUCH (upper barrier): we want price moving DOWN or FLAT.
+    Upward momentum increases the probability of touching the upper barrier.
+    Score = 1.0 when momentum is strongly downward, 0.5 when flat,
+            0.0 when strongly upward.
     """
-    def __init__(self, symbol: str, cfg: dict):
-        self.symbol = symbol
-        self.cfg    = cfg
-        self.ts     = TickStore(symbol, maxlen=cfg["tick_window"])
-        # Per-symbol win/loss tracking for logging
-        self.wins   = 0
-        self.losses = 0
-        self.total_profit = 0.0
+    prices = list(ts.prices)
+    if len(prices) < medium_n + 1:
+        return 0.5, "momentum=insufficient_data"
 
-    def add_tick(self, price: float):
-        self.ts.add(price)
+    # Short momentum: net tick direction over last short_n ticks
+    short_prices = prices[-short_n-1:]
+    short_move   = (short_prices[-1] - short_prices[0]) / abs(short_prices[0]) \
+                   if short_prices[0] != 0 else 0.0
 
-    def is_ready(self) -> bool:
-        return self.ts.is_ready(self.cfg["min_ticks"])
+    # Medium momentum: net tick direction over last medium_n ticks
+    med_prices = prices[-medium_n-1:]
+    med_move   = (med_prices[-1] - med_prices[0]) / abs(med_prices[0]) \
+                 if med_prices[0] != 0 else 0.0
 
-    def evaluate(self, er_candidates: List[ERCandidate],
-                 nt_candidates: List[NTCandidate],
-                 balance: float) -> TradeSignal:
-        """
-        Called AFTER real quote fetches have populated .ev and .payout_ratio
-        on all candidates. Picks the best contract type and parameters,
-        sizes the stake, and returns a TradeSignal (or SKIP).
-        """
-        sigma  = self.ts.local_vol(self.cfg["vol_window"])
-        hurst  = self.ts.hurst(self.cfg["hurst_window"])
-        regime = classify_regime(sigma, self.cfg)
+    if contract_type == "EXPIRYRANGE":
+        # Low |move| in both windows → high score
+        # Normalise against typical move magnitude for 1Hz instruments
+        norm = 0.0005   # ~50% of σ for 1HZ100V over 20 ticks
+        s_score = max(0.0, 1.0 - abs(short_move) / norm)
+        m_score = max(0.0, 1.0 - abs(med_move) / (norm * 2))
+        score   = 0.5 * s_score + 0.5 * m_score
+        reason  = (f"momentum_er short={short_move*100:+.3f}% "
+                   f"med={med_move*100:+.3f}% score={score:.2f}")
+    else:  # NOTOUCH upper barrier
+        # Downward move → score > 0.5, upward move → score < 0.5
+        norm    = 0.0005
+        s_score = max(0.0, min(1.0, 0.5 - short_move / norm * 0.5))
+        m_score = max(0.0, min(1.0, 0.5 - med_move / (norm * 2) * 0.5))
+        score   = 0.5 * s_score + 0.5 * m_score
+        direction = "down" if (short_move + med_move) < 0 else "up/flat"
+        reason  = (f"momentum_nt {direction} short={short_move*100:+.3f}% "
+                   f"med={med_move*100:+.3f}% score={score:.2f}")
 
-        reasons = [
-            f"σ={sigma:.6f}  regime={regime.value}",
-            f"H={hurst:.3f}",
-        ]
+    return score, reason
 
-        if regime == VolRegime.SKIP:
-            return TradeSignal("SKIP", self.symbol, 0, 0, 0, 0, 0, 0, 0,
-                               reasons + ["vol too extreme"])
 
-        # Filter candidates by minimum EV margin
-        er_viable = [c for c in er_candidates if c.ev >= self.cfg["er_min_ev"]]
-        nt_viable = [c for c in nt_candidates if c.ev >= self.cfg["nt_min_ev"]]
+def _vol_score(ts: TickStore, vol_window: int, vol_skip: float,
+               barrier: float, duration_s: int,
+               contract_type: str) -> Tuple[float, str]:
+    """
+    Layer 2 — Volatility.
 
-        # Apply regime preference: bias toward the contract type that suits
-        # current conditions, but always let real EV be the final arbiter.
-        # Regime preference is a tiebreaker, not a veto.
-        best_er = max(er_viable, key=lambda c: c.ev) if er_viable else None
-        best_nt = max(nt_viable, key=lambda c: c.ev) if nt_viable else None
+    Key insight: the expected absolute price move over `duration_s` ticks
+    under GBM is approximately σ × √T × current_price (in price units).
+    We compare this expected move against the barrier to assess feasibility.
 
-        mode = self.cfg["contract_mode"]
+    EXPIRYRANGE: expected_move << barrier → high score (price likely stays inside)
+                 expected_move ≈ barrier  → moderate score
+                 expected_move >> barrier → skip (price likely exits)
 
-        if mode == "expiryrange":
-            best_nt = None
-        elif mode == "notouch":
-            best_er = None
+    NOTOUCH (upper): expected_max_excursion << barrier → high score
+                     We estimate max excursion as ~2.5σ√T (95th percentile
+                     of absolute maximum of a Brownian path).
+    """
+    sigma = ts.local_vol(vol_window)
+    price = ts.current_price() or 1.0
 
-        if best_er is None and best_nt is None:
-            return TradeSignal("SKIP", self.symbol, 0, 0, 0, 0, 0, 0, 0,
-                               reasons + ["no candidate cleared EV floor"])
+    if sigma <= 0 or sigma >= vol_skip:
+        return 0.0, f"vol=skip (σ={sigma:.6f})"
 
-        # Pick the contract type with the higher real EV
-        chosen_type = None
-        chosen      = None
-        if best_er and best_nt:
-            if best_er.ev >= best_nt.ev:
-                chosen_type, chosen = "EXPIRYRANGE", best_er
-            else:
-                chosen_type, chosen = "NOTOUCH", best_nt
-        elif best_er:
-            chosen_type, chosen = "EXPIRYRANGE", best_er
-        else:
-            chosen_type, chosen = "NOTOUCH", best_nt
+    # Expected price move magnitude in absolute units over duration
+    expected_move  = sigma * math.sqrt(duration_s) * price
+    # Expected maximum excursion (Brownian motion max ≈ 2.5 × std for 95th pct)
+    expected_max   = 2.5 * sigma * math.sqrt(duration_s) * price
 
-        reasons += [
-            f"contract={chosen_type}",
-            f"dur={chosen.duration_s}s",
-            f"barriers=[{chosen.barrier_low:.4f}, {chosen.barrier_high:.4f}]",
-            f"p_win_mc={chosen.p_win_mc:.3f}",
-            f"payout_ratio={chosen.payout_ratio:.3f}",
-            f"EV={chosen.ev:+.4f}",
-        ]
+    if contract_type == "EXPIRYRANGE":
+        ratio = expected_move / barrier if barrier > 0 else 1.0
+        # ratio < 0.5 → well inside → 1.0 score
+        # ratio = 1.0 → expected move = barrier → 0.5 score
+        # ratio > 1.5 → likely exit → 0.0 score
+        score  = max(0.0, min(1.0, 1.0 - (ratio - 0.5)))
+        reason = (f"vol_er σ={sigma:.5f} exp_move={expected_move:.2f} "
+                  f"barrier={barrier:.2f} ratio={ratio:.2f} score={score:.2f}")
+    else:  # NOTOUCH upper
+        ratio = expected_max / barrier if barrier > 0 else 1.0
+        # ratio < 0.6 → max excursion well below barrier → 1.0 score
+        # ratio = 1.0 → expected max = barrier → 0.0 score
+        score  = max(0.0, min(1.0, 1.0 - ratio))
+        reason = (f"vol_nt σ={sigma:.5f} exp_max={expected_max:.2f} "
+                  f"barrier={barrier:.2f} ratio={ratio:.2f} score={score:.2f}")
 
-        # Kelly stake sizing
-        p   = chosen.p_win_mc
-        r   = chosen.payout_ratio
-        kelly = (p * r - (1 - p)) / r if r > 0 else 0.0
-        kelly_frac = self.cfg["kelly_fraction"]
-        raw_stake  = balance * kelly * kelly_frac
-        stake = max(
-            self.cfg["min_stake"],
-            min(raw_stake, balance * self.cfg["max_stake_pct"])
-        )
-        stake = round(stake, 2)
+    return score, reason
 
-        reasons.append(f"kelly={kelly:.4f}  stake=${stake:.2f}")
 
-        return TradeSignal(
-            contract_type = chosen_type,
-            symbol        = self.symbol,
-            duration_s    = chosen.duration_s,
-            barrier_low   = chosen.barrier_low,
-            barrier_high  = chosen.barrier_high,
-            p_win_mc      = chosen.p_win_mc,
-            payout_ratio  = chosen.payout_ratio,
-            ev            = chosen.ev,
-            stake         = stake,
-            reasons       = reasons,
-        )
+def _hurst_score(ts: TickStore, hurst_window: int, contract_type: str) -> Tuple[float, str]:
+    """
+    Layer 3 — Hurst exponent.
+
+    EXPIRYRANGE: H < 0.5 (mean-reverting) is ideal. Mean-reverting price
+    is likely to oscillate back toward centre rather than drift to edges.
+    Score ramps from 0 at H=0.7 to 1.0 at H=0.3.
+
+    NOTOUCH (upper barrier): Either H < 0.45 (strong mean-reversion — price
+    is unlikely to sustain a run toward the barrier) OR H > 0.55 with
+    downward momentum (strong trend away from the barrier). Since we check
+    momentum separately, score here based on deviation from random walk:
+    H far from 0.5 in either direction → higher score (market has structure).
+    """
+    H      = ts.hurst(hurst_window)
+    if contract_type == "EXPIRYRANGE":
+        # Ideal at H=0.30, worst at H=0.70
+        score  = max(0.0, min(1.0, (0.70 - H) / 0.40))
+        reason = f"hurst_er H={H:.3f} score={score:.2f}"
+    else:  # NOTOUCH
+        # Score based on |H - 0.5| — structured market (either direction)
+        deviation = abs(H - 0.5)
+        score     = min(1.0, deviation / 0.25)
+        regime    = "mean-rev" if H < 0.5 else "trending"
+        reason    = f"hurst_nt H={H:.3f} ({regime}) score={score:.2f}"
+
+    return score, reason
+
+
+def _proximity_score(ts: TickStore, barrier: float, contract_type: str,
+                     proximity_gate: float, centre_gate: float) -> Tuple[float, str]:
+    """
+    Layer 4 — Barrier proximity.
+
+    NOTOUCH: if current price is already close to the upper barrier,
+    the trade is too risky regardless of what other layers say.
+    Gate = hard block when price is within proximity_gate% of barrier.
+
+    EXPIRYRANGE: if price has already moved more than centre_gate of the
+    barrier from centre (i.e. is already near one edge), it's more likely
+    to exit. Score based on how centred price is.
+    """
+    prices = list(ts.prices)
+    if len(prices) < 10:
+        return 0.5, "proximity=insufficient_data"
+
+    price = prices[-1]
+    # Centre reference: average of last 30 ticks (slow drift baseline)
+    centre_window = prices[-30:] if len(prices) >= 30 else prices
+    centre = sum(centre_window) / len(centre_window)
+
+    if contract_type == "NOTOUCH":
+        # Distance from current price to upper barrier (in price units)
+        dist_to_upper = barrier   # barrier is the offset from current price at trade time
+        # How far has price moved toward upper relative to barrier?
+        move_toward_upper = max(0.0, price - centre)
+        proximity_ratio   = move_toward_upper / barrier if barrier > 0 else 0.0
+        if proximity_ratio >= proximity_gate:
+            return 0.0, (f"proximity_nt BLOCKED price too close to barrier "
+                         f"ratio={proximity_ratio:.2f}")
+        score  = max(0.0, 1.0 - proximity_ratio / proximity_gate)
+        reason = (f"proximity_nt ratio={proximity_ratio:.2f} "
+                  f"gate={proximity_gate:.2f} score={score:.2f}")
+    else:  # EXPIRYRANGE
+        # How far from centre relative to barrier?
+        price_offset  = abs(price - centre)
+        centre_ratio  = price_offset / barrier if barrier > 0 else 0.0
+        if centre_ratio >= centre_gate:
+            return 0.0, (f"proximity_er BLOCKED price near edge "
+                         f"ratio={centre_ratio:.2f}")
+        score  = max(0.0, 1.0 - centre_ratio / centre_gate)
+        reason = (f"proximity_er offset={price_offset:.3f} "
+                  f"ratio={centre_ratio:.2f} score={score:.2f}")
+
+    return score, reason
+
+
+def mc_p_win_expiryrange(ts: TickStore, barrier: float, duration_s: int,
+                          n_sims: int) -> float:
+    """
+    Layer 5 (EXPIRYRANGE) — Monte Carlo terminal distribution.
+
+    Draws N terminal prices from GBM(µ, σ, T=duration_s ticks).
+    Returns P(|terminal_price - entry_price| < barrier).
+    Closed-form draw: terminal log-return ~ N((µ-σ²/2)T, σ²T).
+    """
+    sigma = ts.local_vol(60)
+    mu    = ts.local_drift(60)
+    price = ts.current_price()
+    if not price or sigma <= 0:
+        return 0.0
+
+    mu_T    = (mu - 0.5 * sigma**2) * duration_s
+    sigma_T = sigma * math.sqrt(duration_s)
+    wins    = 0
+    for _ in range(n_sims):
+        u1 = random.random() or 1e-15
+        u2 = random.random() or 1e-15
+        z  = math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2)
+        terminal = price * math.exp(mu_T + sigma_T * z)
+        if abs(terminal - price) < barrier:
+            wins += 1
+    return wins / n_sims
+
+
+def mc_p_win_notouch(ts: TickStore, barrier: float, duration_s: int,
+                      n_sims: int) -> float:
+    """
+    Layer 5 (NOTOUCH) — Monte Carlo full path simulation.
+
+    Simulates N tick-by-tick GBM paths over duration_s ticks.
+    Returns P(price never touches entry_price + barrier throughout hold).
+    Upper barrier only (as specified).
+    """
+    sigma = ts.local_vol(60)
+    mu    = ts.local_drift(60)
+    price = ts.current_price()
+    if not price or sigma <= 0:
+        return 0.0
+
+    upper_barrier   = price + barrier
+    drift_per_tick  = mu - 0.5 * sigma**2
+
+    # Pre-generate Gaussian noise for all paths (Box-Muller)
+    wins = 0
+    for _ in range(n_sims):
+        s       = price
+        touched = False
+        for _ in range(duration_s):
+            u1 = random.random() or 1e-15
+            u2 = random.random() or 1e-15
+            z  = math.sqrt(-2 * math.log(u1)) * math.cos(2 * math.pi * u2)
+            s  = s * math.exp(drift_per_tick + sigma * z)
+            if s >= upper_barrier:
+                touched = True
+                break
+        if not touched:
+            wins += 1
+    return wins / n_sims
+
+
+def evaluate_signal(ts: TickStore, cfg: dict,
+                    contract_type: str) -> ContractSignal:
+    """
+    Runs all 5 layers for a given contract type and returns a ContractSignal.
+    Layers 1-4 produce a weighted score. If score >= signal_threshold,
+    Layer 5 (MC) runs. If MC p(win) >= mc_min_confidence, signal is ACTIVE.
+    """
+    sym     = ts.symbol
+    barriers = cfg["barriers"].get(sym, {})
+    barrier  = barriers.get("er" if contract_type == "EXPIRYRANGE" else "nt", 1.0)
+    dur      = cfg["duration_s"]
+    reasons  = []
+
+    # Layer weights — MC is separate (mandatory threshold, not weighted)
+    WEIGHTS = {
+        "momentum":  0.30,
+        "vol":       0.35,
+        "hurst":     0.20,
+        "proximity": 0.15,
+    }
+
+    # Layer 1 — Momentum
+    s1, r1 = _momentum_score(ts, cfg["momentum_short_n"],
+                              cfg["momentum_medium_n"], contract_type)
+    reasons.append(r1)
+
+    # Layer 2 — Volatility
+    s2, r2 = _vol_score(ts, cfg["vol_window"], cfg["vol_skip_thresh"],
+                         barrier, dur, contract_type)
+    reasons.append(r2)
+    if s2 == 0.0 and "skip" in r2:
+        return ContractSignal("SKIP", sym, barrier, 0.0, 0.0,
+                              reasons + ["vol_skip triggered"])
+
+    # Layer 3 — Hurst
+    s3, r3 = _hurst_score(ts, cfg["hurst_window"], contract_type)
+    reasons.append(r3)
+
+    # Layer 4 — Proximity
+    s4, r4 = _proximity_score(ts, barrier, contract_type,
+                               cfg["nt_proximity_gate"], cfg["er_centre_gate"])
+    reasons.append(r4)
+    if s4 == 0.0 and "BLOCKED" in r4:
+        return ContractSignal("SKIP", sym, barrier, 0.0, 0.0,
+                              reasons + ["proximity gate blocked"])
+
+    # Weighted pre-MC score
+    layer_score = (WEIGHTS["momentum"]  * s1 +
+                   WEIGHTS["vol"]       * s2 +
+                   WEIGHTS["hurst"]     * s3 +
+                   WEIGHTS["proximity"] * s4)
+    reasons.append(f"layer_score={layer_score:.3f} "
+                   f"(threshold={cfg['signal_threshold']:.2f})")
+
+    if layer_score < cfg["signal_threshold"]:
+        return ContractSignal("SKIP", sym, barrier, 0.0, layer_score,
+                              reasons + ["below signal threshold"])
+
+    # Layer 5 — Monte Carlo (only runs if layers 1-4 pass)
+    if contract_type == "EXPIRYRANGE":
+        p_win = mc_p_win_expiryrange(ts, barrier, dur, cfg["mc_n_sims"])
+    else:
+        p_win = mc_p_win_notouch(ts, barrier, dur, cfg["mc_n_sims"])
+
+    reasons.append(f"MC p_win={p_win:.3f} "
+                   f"(min={cfg['mc_min_confidence']:.2f})")
+
+    if p_win < cfg["mc_min_confidence"]:
+        return ContractSignal("SKIP", sym, barrier, p_win, layer_score,
+                              reasons + ["MC below confidence threshold"])
+
+    return ContractSignal(contract_type, sym, barrier, p_win,
+                          layer_score, reasons)
 
 
 # ============================================================================
@@ -938,42 +966,6 @@ class DerivClient:
             _log("BALANCE", f"Fetch error: {exc}")
         return None
 
-    async def fetch_er_quote(self, symbol: str, cand: ERCandidate,
-                             stake: float) -> Optional[float]:
-        half_width = (cand.barrier_high - cand.barrier_low) / 2
-        req = {
-            "proposal":           1,
-            "amount":             stake,
-            "basis":              "stake",
-            "contract_type":      "EXPIRYRANGE",
-            "currency":           self.cfg["currency"],
-            "duration":           cand.duration_s,
-            "duration_unit":      "s",
-            "underlying_symbol":  symbol,
-            "barrier":            f"+{half_width:.2f}",   # max 2 decimal places
-            "barrier2":           f"-{half_width:.2f}",
-        }
-        return await self._fetch_proposal_ratio(
-            req, f"EXPIRYRANGE {symbol} {cand.duration_s}s ±{half_width:.2f}", cand.p_win_mc)
-
-    async def fetch_nt_quote(self, symbol: str, cand: NTCandidate,
-                             stake: float) -> Optional[float]:
-        half_dist = cand.barrier_dist
-        req = {
-            "proposal":           1,
-            "amount":             stake,
-            "basis":              "stake",
-            "contract_type":      "NOTOUCH",
-            "currency":           self.cfg["currency"],
-            "duration":           cand.duration_s,
-            "duration_unit":      "s",
-            "underlying_symbol":  symbol,
-            # Single upper barrier only: price must not touch the level above.
-            "barrier":            f"+{half_dist:.2f}",
-        }
-        return await self._fetch_proposal_ratio(
-            req, f"NOTOUCH {symbol} {cand.duration_s}s +{half_dist:.2f}", cand.p_win_mc)
-
     async def _fetch_proposal_ratio(self, req: dict, label: str,
                                     p_win_mc: float) -> Optional[float]:
         """
@@ -1014,25 +1006,26 @@ class DerivClient:
 
     async def place_trade(self, sig: TradeSignal) -> Optional[str]:
         """
-        Gets a fresh proposal for the chosen contract + parameters,
-        then immediately buys it. Returns the contract_id or None.
+        Proposal + buy at fixed barrier. Uses sig.barrier directly.
+        EXPIRYRANGE: barrier + barrier2 (symmetric ±)
+        NOTOUCH: upper barrier only (+offset)
         """
         contract_type = sig.contract_type
-        half_width = (sig.barrier_high - sig.barrier_low) / 2
+        barrier       = sig.barrier
         req = {
             "proposal":           1,
             "amount":             sig.stake,
             "basis":              "stake",
             "contract_type":      contract_type,
             "currency":           self.cfg["currency"],
-            "duration":           sig.duration_s,
-            "duration_unit":      "s",
+            "duration":           self.cfg["duration_s"],
+            "duration_unit":      self.cfg["duration_unit"],
             "underlying_symbol":  sig.symbol,
-            "barrier":            f"+{half_width:.2f}",
+            "barrier":            f"+{barrier:.2f}",
         }
         if contract_type == "EXPIRYRANGE":
-            req["barrier2"] = f"-{half_width:.2f}"
-        # NOTOUCH: single upper barrier only on 1HZ synthetic indices
+            req["barrier2"] = f"-{barrier:.2f}"
+        # NOTOUCH: single upper barrier only
 
         proposal = await self.send_with_id(req, timeout=12)
         if proposal is None or "error" in proposal:
@@ -1043,14 +1036,16 @@ class DerivClient:
         prop_data   = proposal.get("proposal", {})
         proposal_id = prop_data.get("id")
         ask_price   = float(prop_data.get("ask_price", sig.stake))
+        payout      = float(prop_data.get("payout", 0))
         if not proposal_id:
             _log("PROPOSAL", "No proposal ID")
             return None
 
+        ratio = (payout - ask_price) / ask_price if ask_price > 0 else 0
         _log("PROPOSAL",
-             f"{contract_type} {sig.symbol} {sig.duration_s}s "
-             f"barriers=[{sig.barrier_low:.4f},{sig.barrier_high:.4f}] "
-             f"ask=${ask_price:.2f}")
+             f"{contract_type} {sig.symbol} +{barrier:.2f} "
+             f"ask=${ask_price:.2f} payout=${payout:.2f} "
+             f"return={ratio*100:.1f}%")
 
         buy_time    = time.time()
         contract_id = None
@@ -1079,7 +1074,7 @@ class DerivClient:
 
         _log("TRADE",
              f"{contract_type} {sig.symbol} ${sig.stake:.2f} "
-             f"{sig.duration_s}s contract={contract_id}")
+             f"{self.cfg['duration_s']}s contract={contract_id}")
         try:
             await self.send({"proposal_open_contract": 1,
                              "contract_id": contract_id, "subscribe": 1})
@@ -1104,6 +1099,26 @@ class DerivClient:
             except Exception as exc:
                 _log("ORPHAN", f"Poll {attempt+1} error: {exc}")
         return None
+
+
+# ============================================================================
+# SIGNAL ENGINE (lightweight wrapper — logic now lives in evaluate_signal())
+# ============================================================================
+
+class SignalEngine:
+    def __init__(self, symbol: str, cfg: dict):
+        self.symbol       = symbol
+        self.cfg          = cfg
+        self.ts           = TickStore(symbol, maxlen=cfg["tick_window"])
+        self.wins         = 0
+        self.losses       = 0
+        self.total_profit = 0.0
+
+    def add_tick(self, price: float):
+        self.ts.add(price)
+
+    def is_ready(self) -> bool:
+        return self.ts.is_ready(self.cfg["min_ticks"])
 
 
 # ============================================================================
@@ -1146,92 +1161,6 @@ class RangeBot:
         self._stop:              bool          = False
         self._last_persist:      float         = 0.0
 
-    # ── Contract spec discovery ───────────────────────────────────────────────
-
-    async def _discover_contracts(self, symbol: str):
-        """
-        Calls contracts_for to discover valid durations, barrier types, and
-        barrier count for EXPIRYRANGE and NOTOUCH on this symbol. Updates
-        the config live so the MC scanners and quote fetchers use values
-        that Deriv will actually accept — rather than hand-tuned guesses
-        that produce ContractBuyValidationError or InvalidBarrierSingle.
-        """
-        resp = await self.client.send_with_id(
-            {"contracts_for": symbol, "currency": self.cfg["currency"],
-             "landing_company": "svg"}, timeout=15
-        )
-        if not resp or "error" in resp:
-            _log("CONTRACTS", f"{symbol}: could not fetch contracts_for — "
-                              f"using config defaults")
-            return
-
-        available = resp.get("contracts_for", {}).get("available", [])
-        if not available:
-            _log("CONTRACTS", f"{symbol}: empty available list")
-            return
-
-        er_durations_s, nt_durations_s = set(), set()
-        nt_single_barrier = False
-
-        for c in available:
-            ct = c.get("contract_type", "")
-            # Duration info
-            min_d = c.get("min_contract_duration", "")
-            max_d = c.get("max_contract_duration", "")
-
-            def parse_dur_s(d: str) -> Optional[int]:
-                if not d:
-                    return None
-                try:
-                    if d.endswith("t"):
-                        return int(d[:-1])      # ticks — treat as seconds for 1Hz
-                    elif d.endswith("s"):
-                        return int(d[:-1])
-                    elif d.endswith("m"):
-                        return int(d[:-1]) * 60
-                    elif d.endswith("h"):
-                        return int(d[:-1]) * 3600
-                    return int(d)
-                except (ValueError, IndexError):
-                    return None
-
-            min_s = parse_dur_s(min_d)
-            max_s = parse_dur_s(max_d)
-
-            barrier_cat = c.get("barrier_category", "")
-
-            if ct == "EXPIRYRANGE" and min_s and max_s:
-                # Generate candidate durations between min and max
-                for t in [5, 10, 15, 30, 60, 120, 300, 600]:
-                    if min_s <= t <= max_s:
-                        er_durations_s.add(t)
-
-            if ct == "NOTOUCH" and min_s and max_s:
-                for t in [5, 10, 15, 30, 60, 120, 300]:
-                    if min_s <= t <= max_s:
-                        nt_durations_s.add(t)
-                # single barrier if category is non-euro/american
-                if barrier_cat in ("non_euro_american", "euro_non_atm"):
-                    nt_single_barrier = True
-
-        if er_durations_s:
-            self.cfg[f"{symbol}_er_durations"] = sorted(er_durations_s)
-            _log("CONTRACTS", f"{symbol} EXPIRYRANGE durations: "
-                              f"{sorted(er_durations_s)}s")
-        else:
-            _log("CONTRACTS", f"{symbol}: no EXPIRYRANGE durations found — "
-                              f"using defaults {self.cfg['er_durations']}")
-
-        if nt_durations_s:
-            self.cfg[f"{symbol}_nt_durations"] = sorted(nt_durations_s)
-            _log("CONTRACTS", f"{symbol} NOTOUCH durations: "
-                              f"{sorted(nt_durations_s)}s  single_barrier={nt_single_barrier}")
-        else:
-            _log("CONTRACTS", f"{symbol}: no NOTOUCH durations found — "
-                              f"using defaults {self.cfg['nt_durations']}")
-
-        self.cfg[f"{symbol}_nt_single_barrier"] = nt_single_barrier
-
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _is_settled(self, data: dict) -> bool:
@@ -1243,16 +1172,9 @@ class RangeBot:
         return False
 
     def _can_trade_session(self) -> bool:
-        target = self.cfg["target_profit"]
-        stop   = self.cfg["stop_loss"]
-        if self.session_start_bal > 0:
-            if self.cfg["target_profit_pct"] > 0:
-                target = self.session_start_bal * self.cfg["target_profit_pct"]
-            if self.cfg["stop_loss_pct"] > 0:
-                stop   = self.session_start_bal * self.cfg["stop_loss_pct"]
-        if target > 0 and self.total_profit >= target:
-            _log("RISK", f"Session target reached (+${self.total_profit:.2f})")
-            return False
+        stop = self.cfg["stop_loss"]
+        if self.session_start_bal > 0 and self.cfg.get("stop_loss_pct", 0) > 0:
+            stop = self.session_start_bal * self.cfg["stop_loss_pct"]
         if self.total_profit <= -stop:
             _log("RISK", f"Session stop-loss hit (${self.total_profit:.2f})")
             return False
@@ -1262,7 +1184,7 @@ class RangeBot:
         if not st.waiting or st.lock_since is None:
             return
         elapsed = time.monotonic() - st.lock_since
-        timeout = (st.current_sig.duration_s if st.current_sig else 300) + 60
+        timeout = self.cfg["lock_timeout"]
         if elapsed >= timeout:
             _log("TIMEOUT",
                  f"{st.symbol} locked {elapsed:.0f}s (limit {timeout}s) — unlocking")
@@ -1273,46 +1195,21 @@ class RangeBot:
 
     # ── Quote fetching ────────────────────────────────────────────────────────
 
-    async def _quote_er_candidates(self, sym: str,
-                                   candidates: List[ERCandidate],
-                                   stake: float):
-        """Fetch real payout quotes for EXPIRYRANGE candidates concurrently."""
-        tasks = [self.client.fetch_er_quote(sym, c, stake) for c in candidates]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for cand, ratio in zip(candidates, results):
-            if isinstance(ratio, Exception) or ratio is None:
-                cand.payout_ratio = 0.0
-                cand.ev           = -999.0
-            else:
-                cand.payout_ratio = ratio
-                cand.ev           = cand.p_win_mc * ratio - (1 - cand.p_win_mc)
-
-    async def _quote_nt_candidates(self, sym: str,
-                                   candidates: List[NTCandidate],
-                                   stake: float):
-        """Fetch real payout quotes for NOTOUCH candidates concurrently."""
-        tasks = [self.client.fetch_nt_quote(sym, c, stake) for c in candidates]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for cand, ratio in zip(candidates, results):
-            if isinstance(ratio, Exception) or ratio is None:
-                cand.payout_ratio = 0.0
-                cand.ev           = -999.0
-            else:
-                cand.payout_ratio = ratio
-                cand.ev           = cand.p_win_mc * ratio - (1 - cand.p_win_mc)
-
     # ── Per-symbol evaluation ─────────────────────────────────────────────────
 
     async def _evaluate_symbol(self, st: SymbolState):
-        """Full evaluation cycle for one symbol: MC scan → quote → signal."""
+        """
+        Full evaluation cycle for one symbol.
+        New approach: run 5-layer intelligence at fixed barriers, no grid scan.
+        If both contract types pass, pick the one with the higher MC confidence.
+        """
         if st.waiting:
             return
         now = time.monotonic()
         if now - st.last_eval_time < self.cfg["eval_cooldown"]:
             return
         if now < st.cb_paused_until:
-            remaining = st.cb_paused_until - now
-            _log("BREAKER", f"{st.symbol} paused {remaining:.0f}s")
+            _log("BREAKER", f"{st.symbol} paused {st.cb_paused_until - now:.0f}s")
             return
         if not self._can_trade_session():
             return
@@ -1320,71 +1217,69 @@ class RangeBot:
             return
 
         st.last_eval_time = now
-        sym = st.symbol
-        ts  = st.engine.ts
+        sym  = st.symbol
+        ts   = st.engine.ts
         mode = self.cfg["contract_mode"]
 
-        # Rough stake estimate for quoting (will be refined by Kelly in evaluate())
-        est_stake = max(self.cfg["min_stake"],
-                        min(self.balance * 0.02, self.balance * self.cfg["max_stake_pct"]))
-        est_stake = round(est_stake, 2)
-
-        # MC scans — use discovered durations if available, else config defaults
-        er_cands: List[ERCandidate] = []
-        nt_cands: List[NTCandidate] = []
-        er_durs = self.cfg.get(f"{sym}_er_durations", self.cfg["er_durations"])
-        nt_durs = self.cfg.get(f"{sym}_nt_durations", self.cfg["nt_durations"])
-
-        scan_cfg = dict(self.cfg)
-        scan_cfg["er_durations"] = er_durs
-        scan_cfg["nt_durations"] = nt_durs
-
+        # Run 5-layer intelligence for each requested contract type
+        er_sig = nt_sig = None
         if mode in ("both", "expiryrange"):
-            er_cands = mc_scan_expiryrange(ts, scan_cfg)
+            er_sig = evaluate_signal(ts, self.cfg, "EXPIRYRANGE")
         if mode in ("both", "notouch"):
-            nt_cands = mc_scan_notouch(ts, scan_cfg)
+            nt_sig = evaluate_signal(ts, self.cfg, "NOTOUCH")
 
-        if not er_cands and not nt_cands:
-            _log(sym, "No MC candidates generated — skipping")
-            return
+        # Pick the contract type with higher MC confidence (both must pass threshold)
+        active_sigs = [s for s in [er_sig, nt_sig]
+                       if s and s.contract_type != "SKIP"]
+        chosen: Optional[ContractSignal] = None
+        if active_sigs:
+            chosen = max(active_sigs, key=lambda s: s.p_win_mc)
 
-        # Concurrent real quote fetches
-        quote_tasks = []
-        if er_cands:
-            quote_tasks.append(self._quote_er_candidates(sym, er_cands, est_stake))
-        if nt_cands:
-            quote_tasks.append(self._quote_nt_candidates(sym, nt_cands, est_stake))
-        await asyncio.gather(*quote_tasks)
-
-        # Evaluate and produce signal
-        sig = st.engine.evaluate(er_cands, nt_cands, self.balance)
-
+        # Always print the signal block
         print(f"\n{'='*60}")
         print(f"SIGNAL  {sym}  {_ts()}")
-        for r in sig.reasons:
-            print(f"  · {r}")
-        if sig.contract_type == "SKIP":
+        for sig_candidate, label in [(er_sig, "ER"), (nt_sig, "NT")]:
+            if sig_candidate:
+                print(f"  [{label}]")
+                for r in sig_candidate.reasons:
+                    print(f"    · {r}")
+        if not chosen:
             print(f"  → No trade")
         else:
-            print(f"  → {sig.contract_type}  stake=${sig.stake:.2f}  "
-                  f"EV={sig.ev:+.4f}")
+            stake = min(self.cfg["stake"], self.cfg["max_stake"])
+            print(f"  → {chosen.contract_type} barrier=±{chosen.barrier:.2f} "
+                  f"p_win={chosen.p_win_mc:.3f} "
+                  f"layer_score={chosen.layer_score:.3f} "
+                  f"stake=${stake:.2f}")
         print(f"{'='*60}")
 
-        if sig.contract_type == "SKIP":
+        if not chosen:
             return
+
+        # Convert to TradeSignal for place_trade
+        stake = round(min(self.cfg["stake"], self.cfg["max_stake"]), 2)
+        trade_sig = TradeSignal(
+            contract_type = chosen.contract_type,
+            symbol        = sym,
+            barrier       = chosen.barrier,
+            p_win_mc      = chosen.p_win_mc,
+            layer_score   = chosen.layer_score,
+            stake         = stake,
+            reasons       = chosen.reasons,
+        )
 
         # Snap balance before trade
         bal = await self.client.fetch_balance()
         if bal is not None:
-            self.balance       = bal
-            st.balance_before  = bal
+            self.balance      = bal
+            st.balance_before = bal
 
         # Place trade
-        contract_id = await self.client.place_trade(sig)
+        contract_id = await self.client.place_trade(trade_sig)
         if contract_id:
             st.waiting     = True
             st.contract_id = contract_id
-            st.current_sig = sig
+            st.current_sig = trade_sig
             st.lock_since  = time.monotonic()
             _log("LOCK", f"{sym} waiting on {contract_id}")
         else:
@@ -1519,11 +1414,6 @@ class RangeBot:
         for sym, st in self.states.items():
             self.store.load_symbol_stats(sym, st.engine)
 
-        # Discover valid contract specs from Deriv before trading
-        _log("BOT", "Discovering valid contract specs from Deriv...")
-        for sym in self.symbols:
-            await self._discover_contracts(sym)
-
         # Subscribe to all symbols
         for sym in self.symbols:
             if not await self.client.subscribe_ticks(sym):
@@ -1634,14 +1524,14 @@ class RangeBot:
                         eng   = st.engine
                         total = eng.wins + eng.losses
                         wr    = eng.wins / total * 100 if total else 0
-                        sigma = st.engine.ts.local_vol(self.cfg["vol_window"])
-                        hurst = st.engine.ts.hurst(self.cfg["hurst_window"])
-                        regime = classify_regime(sigma, self.cfg)
+                        sigma = eng.ts.local_vol(self.cfg["vol_window"])
+                        hurst = eng.ts.hurst(self.cfg["hurst_window"])
+                        barriers = self.cfg["barriers"].get(sym, {})
                         print(f"\n  {sym}: W:{eng.wins} L:{eng.losses} "
                               f"WR:{wr:.1f}% P&L:${eng.total_profit:+.2f}")
-                        print(f"    σ={sigma:.6f} ({regime.value})  "
-                              f"H={hurst:.3f}  "
-                              f"ticks={st.engine.ts.count}")
+                        print(f"    σ={sigma:.6f}  H={hurst:.3f}  ticks={eng.ts.count}")
+                        print(f"    barriers ER=±{barriers.get('er','?')} "
+                              f"NT=+{barriers.get('nt','?')}")
                         print(f"    waiting={st.waiting}  "
                               f"cb_paused={st.cb_paused_until > time.monotonic()}")
                     print(f"\n  Session P&L: ${self.total_profit:+.2f}  "
