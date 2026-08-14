@@ -883,12 +883,7 @@ class DerivClient:
 
     async def fetch_er_quote(self, symbol: str, cand: ERCandidate,
                              stake: float) -> Optional[float]:
-        """
-        Fetches a real EXPIRYRANGE proposal from Deriv and returns the
-        net profit ratio (payout - stake) / stake, or None on failure.
-        Barriers are absolute price levels; duration in seconds (= ticks
-        for 1Hz symbols since 1 tick = 1 second).
-        """
+        half_width = (cand.barrier_high - cand.barrier_low) / 2
         req = {
             "proposal":      1,
             "amount":        stake,
@@ -898,27 +893,15 @@ class DerivClient:
             "duration":      cand.duration_s,
             "duration_unit": "s",
             "symbol":        symbol,
-            "barrier":       f"{cand.barrier_high:.4f}",
-            "barrier2":      f"{cand.barrier_low:.4f}",
+            "barrier":       f"+{half_width:.4f}",
+            "barrier2":      f"-{half_width:.4f}",
         }
-        await self.send(req)
-        resp = await self.receive_type("proposal", timeout=12)
-        if resp is None or "error" in resp:
-            return None
-        data  = resp.get("proposal", {})
-        ask   = float(data.get("ask_price", 0))
-        pout  = float(data.get("payout", 0))
-        if ask <= 0:
-            return None
-        return (pout - ask) / ask
+        return await self._fetch_proposal_ratio(
+            req, f"EXPIRYRANGE {symbol} {cand.duration_s}s ±{half_width:.4f}", cand.p_win_mc)
 
     async def fetch_nt_quote(self, symbol: str, cand: NTCandidate,
                              stake: float) -> Optional[float]:
-        """
-        Fetches a real NOTOUCH proposal. NOTOUCH on 1Hz symbols uses two
-        barriers. Deriv's contract type for double-barrier no-touch is
-        NOTOUCH with barrier + barrier2.
-        """
+        half_dist = cand.barrier_dist
         req = {
             "proposal":      1,
             "amount":        stake,
@@ -928,19 +911,65 @@ class DerivClient:
             "duration":      cand.duration_s,
             "duration_unit": "s",
             "symbol":        symbol,
-            "barrier":       f"{cand.barrier_high:.4f}",
-            "barrier2":      f"{cand.barrier_low:.4f}",
+            "barrier":       f"+{half_dist:.4f}",
+            "barrier2":      f"-{half_dist:.4f}",
         }
+        return await self._fetch_proposal_ratio(
+            req, f"NOTOUCH {symbol} {cand.duration_s}s ±{half_dist:.4f}", cand.p_win_mc)
+
+    async def _fetch_proposal_ratio(self, req: dict, label: str,
+                                    p_win_mc: float) -> Optional[float]:
+        """
+        Shared proposal fetch. Does NOT use receive_type("proposal") —
+        that helper re-queues non-matching messages and waits indefinitely
+        for exactly the right key, but the new Options API may return the
+        proposal wrapped differently. Instead, we read the next message
+        directly and log whatever keys actually arrive so we can diagnose
+        unexpected response shapes.
+        """
         await self.send(req)
-        resp = await self.receive_type("proposal", timeout=12)
-        if resp is None or "error" in resp:
+        try:
+            resp = await asyncio.wait_for(self._inbox.get(), timeout=12)
+        except asyncio.TimeoutError:
+            _log("QUOTE", f"{label}: TIMEOUT — no response in 12s. "
+                          "Check that this contract type / duration / symbol "
+                          "combination is valid on this account.")
             return None
-        data  = resp.get("proposal", {})
-        ask   = float(data.get("ask_price", 0))
-        pout  = float(data.get("payout", 0))
+
+        if not resp or "__disconnect__" in resp:
+            _log("QUOTE", f"{label}: disconnected mid-quote")
+            if resp:
+                await self._inbox.put(resp)
+            return None
+
+        # Log full message keys so we can see what the API actually returns
+        top_keys = [k for k in resp.keys() if not k.startswith("__")]
+        if "error" in resp:
+            err = resp["error"]
+            _log("QUOTE", f"{label}: API error code={err.get('code','?')} "
+                          f"msg='{err.get('message','?')}'")
+            return None
+
+        # Try "proposal" key (legacy + new API both use this in practice)
+        data = resp.get("proposal", {})
+        if not data:
+            _log("QUOTE", f"{label}: no 'proposal' key in response — "
+                          f"got keys={top_keys}. Full msg: {json.dumps(resp)[:300]}")
+            # Re-queue — might be a tick or other message the main loop needs
+            await self._inbox.put(resp)
+            return None
+
+        ask  = float(data.get("ask_price", 0))
+        pout = float(data.get("payout", 0))
         if ask <= 0:
+            _log("QUOTE", f"{label}: ask_price=0 payout={pout} — skipping")
             return None
-        return (pout - ask) / ask
+
+        ratio = (pout - ask) / ask
+        _log("QUOTE", f"{label}: p_mc={p_win_mc:.3f} ask={ask:.2f} "
+                      f"payout={pout:.2f} ratio={ratio:.3f} "
+                      f"ev={p_win_mc*ratio-(1-p_win_mc):+.4f}")
+        return ratio
 
     async def place_trade(self, sig: TradeSignal) -> Optional[str]:
         """
@@ -948,6 +977,7 @@ class DerivClient:
         then immediately buys it. Returns the contract_id or None.
         """
         contract_type = sig.contract_type
+        half_width = (sig.barrier_high - sig.barrier_low) / 2
         req = {
             "proposal":      1,
             "amount":        sig.stake,
@@ -957,8 +987,8 @@ class DerivClient:
             "duration":      sig.duration_s,
             "duration_unit": "s",
             "symbol":        sig.symbol,
-            "barrier":       f"{sig.barrier_high:.4f}",
-            "barrier2":      f"{sig.barrier_low:.4f}",
+            "barrier":       f"+{half_width:.4f}",
+            "barrier2":      f"-{half_width:.4f}",
         }
         await self.send(req)
         proposal = await self.receive_type("proposal", timeout=12)
