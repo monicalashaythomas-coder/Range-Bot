@@ -157,7 +157,7 @@ CONFIG = {
     # barrier for RDBEAR at 120s expiry via the Deriv API before going live.
     "barriers": {
         "1HZ10V": 1.60,
-        "RDBEAR": 1.00,   # PLACEHOLDER — validate before trading real money
+        "RDBEAR": 2.50,   # PLACEHOLDER — validate before trading real money
     },
 
     # ── Per-symbol volatility skip threshold (Layer 2) ─────────────
@@ -175,7 +175,7 @@ CONFIG = {
     "vol_skip_thresh": {
         "default":  _env("VOL_SKIP", 0.000300),
         "1HZ10V":   _env("VOL_SKIP_1HZ10V", 0.000300),
-        "RDBEAR":   _env("VOL_SKIP_RDBEAR", 0.000500),
+        "RDBEAR":   _env("VOL_SKIP_RDBEAR", 0.000430),
     },
 
     # ── Contract duration ─────────────────────────────────────────
