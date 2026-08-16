@@ -94,6 +94,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -157,7 +158,7 @@ CONFIG = {
     # barrier for RDBEAR at 120s expiry via the Deriv API before going live.
     "barriers": {
         "1HZ10V": 1.60,
-        "RDBEAR": 2.50,   # PLACEHOLDER — validate before trading real money
+        "RDBEAR": 1.00,   # PLACEHOLDER — validate before trading real money
     },
 
     # ── Per-symbol volatility skip threshold (Layer 2) ─────────────
@@ -175,7 +176,7 @@ CONFIG = {
     "vol_skip_thresh": {
         "default":  _env("VOL_SKIP", 0.000300),
         "1HZ10V":   _env("VOL_SKIP_1HZ10V", 0.000300),
-        "RDBEAR":   _env("VOL_SKIP_RDBEAR", 0.000430),
+        "RDBEAR":   _env("VOL_SKIP_RDBEAR", 0.000500),
     },
 
     # ── Contract duration ─────────────────────────────────────────
@@ -585,7 +586,8 @@ class TradeSignal:
     barrier:        float     # absolute barrier offset (+)
     p_win_mc:       float
     layer_score:    float
-    stake:          float
+    rq_score:       float     = 0.0
+    stake:          float     = 0.0
     reasons:        List[str] = field(default_factory=list)
 
 
@@ -711,6 +713,75 @@ def range_quiet_gate(ts: TickStore, cfg: dict) -> Tuple[bool, float, List[str]]:
     reasons.append(f"rq_composite={composite:.3f} (threshold={threshold:.2f})")
 
     return composite >= threshold, composite, reasons
+
+
+def _metrics_snapshot(ts: TickStore, cfg: dict) -> dict:
+    """
+    Independent, read-only snapshot of every raw indicator value at this
+    instant — used purely for logging/analysis, never for trading
+    decisions. Kept separate from the scoring functions above so nothing
+    here can accidentally change what the bot actually trades on.
+
+    Recomputing these is cheap (small rolling windows) and keeps this
+    completely decoupled from range_quiet_gate/evaluate_signal internals,
+    so tuning the logger can never risk the live decision path.
+    """
+    m: dict = {}
+    try:
+        m["ou_theta"] = ts.ou_theta(cfg["rq_window"])
+    except Exception:
+        m["ou_theta"] = None
+    try:
+        m["rsi"] = ts.rsi(cfg["rq_rsi_window"])
+    except Exception:
+        m["rsi"] = None
+    try:
+        m["stoch_rsi"] = ts.stoch_rsi(cfg["rq_rsi_window"], cfg["rq_srsi_window"])
+    except Exception:
+        m["stoch_rsi"] = None
+    try:
+        boll = ts.bollinger(cfg["rq_boll_window"], cfg["rq_boll_k"])
+        m["boll_width_pct"] = boll[3] if boll else None
+    except Exception:
+        m["boll_width_pct"] = None
+    try:
+        m["zscore"] = ts.zscore(cfg["rq_zscore_window"])
+    except Exception:
+        m["zscore"] = None
+    try:
+        sr = ts.support_resistance(cfg["rq_window"])
+        if sr:
+            m["sr_support"], m["sr_resistance"], m["sr_edge_ratio"] = sr
+        else:
+            m["sr_support"] = m["sr_resistance"] = m["sr_edge_ratio"] = None
+    except Exception:
+        m["sr_support"] = m["sr_resistance"] = m["sr_edge_ratio"] = None
+    try:
+        m["sigma"] = ts.local_vol(cfg["vol_window"])
+    except Exception:
+        m["sigma"] = None
+    try:
+        m["mc_sigma"] = ts.local_vol(60)   # same window mc_p_win_expiryrange uses
+        m["mc_mu"]    = ts.local_drift(60)
+    except Exception:
+        m["mc_sigma"] = m["mc_mu"] = None
+    try:
+        m["hurst"] = ts.hurst(cfg["hurst_window"])
+    except Exception:
+        m["hurst"] = None
+    try:
+        prices = list(ts.prices)
+        if len(prices) > cfg["momentum_medium_n"]:
+            sp = prices[-cfg["momentum_short_n"]-1:]
+            mp = prices[-cfg["momentum_medium_n"]-1:]
+            m["momentum_short_pct"] = (sp[-1]-sp[0])/abs(sp[0]) if sp[0] else None
+            m["momentum_med_pct"]   = (mp[-1]-mp[0])/abs(mp[0]) if mp[0] else None
+        else:
+            m["momentum_short_pct"] = m["momentum_med_pct"] = None
+    except Exception:
+        m["momentum_short_pct"] = m["momentum_med_pct"] = None
+    m["price"] = ts.current_price()
+    return m
 
 
 def _momentum_score(ts: TickStore, short_n: int, medium_n: int) -> Tuple[float, str]:
@@ -952,6 +1023,20 @@ class PersistenceStore:
         except Exception as exc:
             _log("STORE", f"Upsert failed: {exc}")
 
+    def _insert(self, table: str, row: dict):
+        """Plain insert (no merge-duplicates) — used for append-only log
+        tables (range_signals, range_trades) where every row is a new
+        event, not a keyed record to overwrite."""
+        if not self.ok:
+            return
+        headers = dict(self._headers)
+        headers["Prefer"] = "return=minimal"
+        try:
+            requests.post(f"{self.url}/rest/v1/{table}",
+                          headers=headers, json=row, timeout=10)
+        except Exception as exc:
+            _log("STORE", f"Insert into {table} failed: {exc}")
+
     def _select(self, table: str, key: str) -> Optional[dict]:
         if not self.ok:
             return None
@@ -987,6 +1072,19 @@ class PersistenceStore:
                           f"P&L=${eng.total_profit:+.2f}")
         except Exception as exc:
             _log("STORE", f"Failed to parse stats for {sym}: {exc}")
+
+    def save_signal(self, row: dict):
+        """Log every evaluation — fired or skipped — to range_signals.
+        This is what makes gate/threshold tuning possible: without the
+        skipped rows you can only ever see the trades that already
+        passed your current thresholds, never how close/far the misses
+        were."""
+        self._insert("range_signals", row)
+
+    def save_trade(self, row: dict):
+        """Log one closed trade (entry snapshot + outcome + price path)
+        to range_trades."""
+        self._insert("range_trades", row)
 
 
 # ============================================================================
@@ -1401,6 +1499,12 @@ class SymbolState:
     consec_losses:    int             = 0
     cb_paused_until:  float           = 0.0
     martingale_step:  int             = 0   # 0 = base stake; resets on win or after max_steps
+    # ── Trade analytics (per open trade) ────────────────────────────
+    entry_price:      Optional[float] = None
+    entry_metrics:    Optional[dict]  = None   # snapshot from _metrics_snapshot at signal time
+    entry_ts_utc:     Optional[str]   = None
+    entry_martingale_step: int        = 0
+    price_path:       List[Tuple[float, float]] = field(default_factory=list)  # (t_offset_s, price)
 
 
 # ============================================================================
@@ -1412,6 +1516,7 @@ class RangeBot:
         self.cfg    = cfg
         self.client = DerivClient(cfg)
         self.store  = PersistenceStore(cfg)
+        self.session_id: str = str(uuid.uuid4())   # groups all rows from this run
 
         self.symbols: List[str] = cfg["symbols"]
         self.states:  Dict[str, SymbolState] = {
@@ -1501,7 +1606,8 @@ class RangeBot:
         ts   = st.engine.ts
 
         # RANGE_QUIET gate + 5-layer EXPIRYRANGE intelligence
-        sig = evaluate_signal(ts, self.cfg)
+        sig     = evaluate_signal(ts, self.cfg)
+        metrics = _metrics_snapshot(ts, self.cfg)
         chosen: Optional[ContractSignal] = sig if sig.contract_type != "SKIP" else None
 
         # Always print the signal block
@@ -1524,6 +1630,25 @@ class RangeBot:
                   f"stake=${stake:.2f}{mg_tag}")
         print(f"{'='*60}")
 
+        # Log EVERY evaluation — fired or skipped — for gate/threshold tuning.
+        self.store.save_signal({
+            "session_id":    self.session_id,
+            "symbol":        sym,
+            "ts":            datetime.utcnow().isoformat(),
+            "fired":         bool(chosen),
+            "contract_type": sig.contract_type,
+            "rq_score":      sig.rq_score,
+            "layer_score":   sig.layer_score,
+            "p_win_mc":      sig.p_win_mc,
+            "barrier":       sig.barrier,
+            "vol_skip_thresh_used": _sym_vol_skip(self.cfg, sym),
+            "rq_threshold_used":    self.cfg["rq_threshold"],
+            "signal_threshold_used": self.cfg["signal_threshold"],
+            "mc_min_confidence_used": self.cfg["mc_min_confidence"],
+            **metrics,
+            "reasons": " | ".join(sig.reasons),
+        })
+
         if not chosen:
             return
 
@@ -1535,6 +1660,7 @@ class RangeBot:
             barrier       = chosen.barrier,
             p_win_mc      = chosen.p_win_mc,
             layer_score   = chosen.layer_score,
+            rq_score      = chosen.rq_score,
             stake         = stake,
             reasons       = chosen.reasons,
         )
@@ -1548,10 +1674,15 @@ class RangeBot:
         # Place trade
         contract_id = await self.client.place_trade(trade_sig)
         if contract_id:
-            st.waiting     = True
-            st.contract_id = contract_id
-            st.current_sig = trade_sig
-            st.lock_since  = time.monotonic()
+            st.waiting        = True
+            st.contract_id    = contract_id
+            st.current_sig    = trade_sig
+            st.lock_since     = time.monotonic()
+            st.entry_price    = metrics.get("price")
+            st.entry_metrics  = metrics
+            st.entry_ts_utc   = datetime.utcnow().isoformat()
+            st.entry_martingale_step = st.martingale_step
+            st.price_path     = [(0.0, metrics.get("price"))] if metrics.get("price") else []
             _log("LOCK", f"{sym} waiting on {contract_id}")
         else:
             st.balance_before = None
@@ -1628,11 +1759,43 @@ class RangeBot:
         if bal_after is not None:
             self.balance = bal_after
 
+        # Persist the full trade record: signal features at entry + the
+        # actual tick-by-tick price path, so it can be compared offline
+        # against the MC-modelled distribution that justified the trade.
+        exit_price = st.engine.ts.current_price()
+        em = st.entry_metrics or {}
+        self.store.save_trade({
+            "session_id":       self.session_id,
+            "symbol":           sym,
+            "contract_id":      cid,
+            "opened_at":        st.entry_ts_utc,
+            "closed_at":        datetime.utcnow().isoformat(),
+            "outcome":          "win" if actual > 0 else "loss",
+            "profit":           actual,
+            "stake":            st.current_sig.stake if st.current_sig else None,
+            "martingale_step":  st.entry_martingale_step,
+            "barrier":          st.current_sig.barrier if st.current_sig else None,
+            "duration_s":       self.cfg["duration_s"],
+            "entry_price":      st.entry_price,
+            "exit_price":       exit_price,
+            "rq_score":         st.current_sig.rq_score if st.current_sig else None,
+            "layer_score":      st.current_sig.layer_score if st.current_sig else None,
+            "p_win_mc":         st.current_sig.p_win_mc if st.current_sig else None,
+            "mc_mu":            em.get("mc_mu"),
+            "mc_sigma":         em.get("mc_sigma"),
+            "price_path":       json.dumps(st.price_path),
+        })
+
         st.waiting      = False
         st.contract_id  = None
         st.current_sig  = None
         st.lock_since   = None
-        st.balance_before = None
+        st.balance_before  = None
+        st.entry_price     = None
+        st.entry_metrics   = None
+        st.entry_ts_utc    = None
+        st.entry_martingale_step = 0
+        st.price_path      = []
 
     # ── Reconnect ─────────────────────────────────────────────────────────────
 
@@ -1753,7 +1916,15 @@ class RangeBot:
                     if sym in self.states:
                         st = self.states[sym]
                         self._check_lock_timeout(st)
-                        st.engine.add_tick(float(tick.get("quote", 0)))
+                        price = float(tick.get("quote", 0))
+                        st.engine.add_tick(price)
+
+                        # While a trade is open, record the actual price path
+                        # so it can be compared against the MC-modelled path
+                        # that justified the trade (see analyze_trades.py).
+                        if st.waiting and st.lock_since is not None:
+                            t_offset = time.monotonic() - st.lock_since
+                            st.price_path.append((round(t_offset, 2), price))
 
                         # Periodic persist
                         now = time.monotonic()
@@ -1874,6 +2045,77 @@ class RangeBot:
 #     total_profit   DOUBLE PRECISION NOT NULL DEFAULT 0,
 #     updated_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 # );
+#
+# -- Every evaluation cycle (fired AND skipped). This is the table that
+# -- makes threshold tuning possible — without the skipped rows you can
+# -- only see the trades that already passed today's thresholds, never
+# -- how close the misses were.
+# CREATE TABLE IF NOT EXISTS range_signals (
+#     id                        BIGSERIAL PRIMARY KEY,
+#     session_id                UUID NOT NULL,
+#     symbol                    TEXT NOT NULL,
+#     ts                        TIMESTAMPTZ NOT NULL DEFAULT now(),
+#     fired                     BOOLEAN NOT NULL,
+#     contract_type             TEXT,
+#     rq_score                  DOUBLE PRECISION,
+#     layer_score               DOUBLE PRECISION,
+#     p_win_mc                  DOUBLE PRECISION,
+#     barrier                   DOUBLE PRECISION,
+#     vol_skip_thresh_used      DOUBLE PRECISION,
+#     rq_threshold_used         DOUBLE PRECISION,
+#     signal_threshold_used     DOUBLE PRECISION,
+#     mc_min_confidence_used    DOUBLE PRECISION,
+#     ou_theta                  DOUBLE PRECISION,
+#     rsi                       DOUBLE PRECISION,
+#     stoch_rsi                 DOUBLE PRECISION,
+#     boll_width_pct            DOUBLE PRECISION,
+#     zscore                    DOUBLE PRECISION,
+#     sr_support                DOUBLE PRECISION,
+#     sr_resistance             DOUBLE PRECISION,
+#     sr_edge_ratio             DOUBLE PRECISION,
+#     sigma                     DOUBLE PRECISION,
+#     mc_sigma                  DOUBLE PRECISION,
+#     mc_mu                     DOUBLE PRECISION,
+#     hurst                     DOUBLE PRECISION,
+#     momentum_short_pct        DOUBLE PRECISION,
+#     momentum_med_pct          DOUBLE PRECISION,
+#     price                     DOUBLE PRECISION,
+#     reasons                   TEXT
+# );
+# CREATE INDEX IF NOT EXISTS range_signals_symbol_ts_idx
+#     ON range_signals (symbol, ts);
+# CREATE INDEX IF NOT EXISTS range_signals_fired_idx
+#     ON range_signals (fired);
+#
+# -- One row per CLOSED trade: entry snapshot + outcome + the actual
+# -- tick-by-tick price path, so it can be compared offline against the
+# -- MC-modelled distribution (mc_mu/mc_sigma/entry_price/duration_s)
+# -- that justified the trade. See analyze_trades.py.
+# CREATE TABLE IF NOT EXISTS range_trades (
+#     id                BIGSERIAL PRIMARY KEY,
+#     session_id        UUID NOT NULL,
+#     symbol            TEXT NOT NULL,
+#     contract_id       TEXT NOT NULL,
+#     opened_at         TIMESTAMPTZ,
+#     closed_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+#     outcome           TEXT NOT NULL,           -- 'win' | 'loss'
+#     profit            DOUBLE PRECISION NOT NULL,
+#     stake             DOUBLE PRECISION,
+#     martingale_step   INTEGER,
+#     barrier           DOUBLE PRECISION,
+#     duration_s        INTEGER,
+#     entry_price       DOUBLE PRECISION,
+#     exit_price        DOUBLE PRECISION,
+#     rq_score          DOUBLE PRECISION,
+#     layer_score       DOUBLE PRECISION,
+#     p_win_mc          DOUBLE PRECISION,
+#     mc_mu             DOUBLE PRECISION,
+#     mc_sigma          DOUBLE PRECISION,
+#     price_path        JSONB              -- [[t_offset_seconds, price], ...]
+# );
+# CREATE INDEX IF NOT EXISTS range_trades_symbol_idx ON range_trades (symbol);
+# CREATE INDEX IF NOT EXISTS range_trades_contract_id_idx ON range_trades (contract_id);
+#
 # NOTIFY pgrst, 'reload schema';
 
 
