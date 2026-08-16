@@ -139,7 +139,7 @@ CONFIG = {
     "use_real_account": _env("DERIV_USE_REAL", False),
 
     # ── Symbols ───────────────────────────────────────────────────
-    "symbols":          ["1HZ10V"],
+    "symbols":          ["1HZ10V", "RDBEAR"],
     "currency":         "USD",
 
     # ── Fixed barriers (confirmed from live API testing) ──────────
@@ -147,7 +147,7 @@ CONFIG = {
     # We do not scan for barriers — they are fixed. The signal layers
     # decide whether market conditions justify trading them.
     "barriers": {
-        "1HZ10V": 1.60,
+        "1HZ10V": 1.60, "RDBEAR": 2.5
     },
 
     # ── Contract duration ─────────────────────────────────────────
