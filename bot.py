@@ -62,32 +62,18 @@ Signal philosophy
       already pushed to one edge
 
   LAYER 5 — Monte Carlo terminal simulation
-    · Primary: GARCH(1,1)-GBM — σ comes from a one-step-ahead GARCH fit
-      (120-tick window) instead of a flat rolling average, so it reacts
-      to recent shocks rather than smoothing over them. Draws N terminal
-      prices from GBM(µ, σ_garch, T=120s).
-    · Cross-check: empirical bootstrap — resamples actual historical
-      tick returns (same window) instead of assuming Gaussian ones,
-      naturally capturing real fat tails/skew. Logged alongside the
-      GARCH-GBM estimate for visibility, does NOT gate the trade.
-    · P(|terminal - entry| < barrier) is the GARCH-GBM estimate; it
-      must clear MIN_MC_CONFIDENCE threshold
+    · Draws N terminal prices from GBM(µ, σ, T=120s)
+    · P(|terminal - entry| < barrier) is the direct estimate
+    · Must clear MIN_MC_CONFIDENCE threshold
     · MC is the final arbiter — all other layers passing but MC
       saying P(win) < threshold → no trade
-    · Calibration logging: at entry, the MC's assumed σ/µ and both
-      p_win estimates are snapshotted; at settlement, realized price
-      move and win/loss are logged alongside them (CALIB log line +
-      range_mc_calibration table) — builds a dataset to check whether
-      MC's stated confidence is actually well-calibrated over time.
 
   AGREEMENT LOGIC:
     · RANGE_QUIET gate must pass first (see above)
     · Each layer votes pass/fail with a confidence weight
     · Total weighted score must exceed SIGNAL_THRESHOLD
-    · GARCH-GBM MC confidence must independently exceed MIN_MC_CONFIDENCE
+    · MC confidence must independently exceed MIN_MC_CONFIDENCE
     · All conditions must hold simultaneously
-    · No EV/payout gate — the bootstrap cross-check and calibration log
-      are for visibility and future tuning, not a second trade gate
 
 Risk management
 ───────────────
@@ -177,7 +163,7 @@ CONFIG = {
     "momentum_short_n":   5,    # short momentum window (ticks)
     "momentum_medium_n":  20,   # medium momentum window (ticks)
     # Layer 2: Volatility
-    "vol_window":         60,   # ticks for σ estimate (Layer 2 gate only)
+    "vol_window":         60,   # ticks for σ estimate
     # How many ticks does price typically move in 120 seconds at this vol?
     # Expected move = σ × √120. Barrier must be > expected move for the
     # trade to be reasonable — this ratio gates signal confidence.
@@ -186,28 +172,9 @@ CONFIG = {
     "hurst_window":       80,
     # Layer 4: Barrier proximity (price vs centre of the range)
     "er_centre_gate":     0.65,  # skip EXPIRYRANGE if price moved >65% of barrier from centre
-
     # Layer 5: Monte Carlo
-    # Shared lookback for the GARCH fit AND the bootstrap resample — one
-    # window feeds both, instead of MC silently using its own hardcoded
-    # window like it used to. 120 (vs the 60 Layer 2 uses) gives the
-    # GARCH(1,1) fit a more stable parameter estimate; GARCH's own
-    # recency-weighting (not the window length) is what keeps it
-    # reactive to a recent shock.
-    "mc_window":           _env("MC_WINDOW", 120),
-    "mc_n_sims":           2000,
-    "mc_min_confidence":   _env("MC_MIN_CONF", 0.72),  # MC p(win) must exceed this
-    # Empirical bootstrap cross-check — resamples actual historical tick
-    # returns instead of assuming Gaussian ones. Run alongside the
-    # GARCH-GBM MC so the two can be compared; does not gate the trade
-    # (no EV/agreement gate — logged for visibility and calibration only).
-    "mc_bootstrap_n_sims": _env("MC_BOOTSTRAP_N_SIMS", 1000),
-
-    # ── MC calibration logging ──────────────────────────────────────
-    # At entry, snapshot what the MC predicted; at settlement, snapshot
-    # what actually happened, so predicted vs realized can be compared
-    # later to check whether MC's p_win is well-calibrated.
-    "mc_calibration_log":  _env("MC_CALIBRATION_LOG", True),
+    "mc_n_sims":          2000,
+    "mc_min_confidence":  _env("MC_MIN_CONF", 0.72),  # MC p(win) must exceed this
 
     # ── Signal agreement threshold ────────────────────────────────
     # Weighted vote from layers 1-4 must exceed this before MC is even run.
@@ -349,90 +316,6 @@ class TickStore:
         if not rets:
             return 0.0
         return sum(rets) / len(rets)
-
-    def _garch_loglik(self, rets: List[float], omega: float,
-                      alpha: float, beta: float, seed_var: float) -> float:
-        var = seed_var
-        ll  = 0.0
-        for i in range(1, len(rets)):
-            var = omega + alpha * rets[i-1]**2 + beta * var
-            if var <= 0:
-                return -1e18
-            ll += -0.5 * (math.log(2 * math.pi * var) + rets[i]**2 / var)
-        return ll
-
-    def garch_sigma(self, window: int = 120) -> float:
-        """
-        One-step-ahead conditional volatility from a GARCH(1,1) fit on
-        the last `window` tick returns — reacts to recent shocks instead
-        of averaging them away like a flat rolling σ does.
-
-        Fit via a coarse grid search over (persistence, alpha-share),
-        maximizing Gaussian log-likelihood — no external dependencies,
-        cheap enough to re-fit every evaluation on ~120 points.
-        Falls back to local_vol() if there isn't enough data or the
-        fit degenerates.
-        """
-        rets = self.returns(window)
-        if len(rets) < 20:
-            return self.local_vol(window)
-
-        n = len(rets)
-        mu = sum(rets) / n
-        long_run_var = sum((r - mu)**2 for r in rets) / n
-        if long_run_var <= 0:
-            return self.local_vol(window)
-
-        best_ll, best_params = -1e18, None
-        for persistence in (0.80, 0.85, 0.90, 0.93, 0.95, 0.97):
-            for alpha_frac in (0.05, 0.10, 0.20, 0.30, 0.40):
-                alpha = persistence * alpha_frac
-                beta  = persistence - alpha
-                if beta < 0 or alpha <= 0:
-                    continue
-                omega = long_run_var * (1 - persistence)
-                if omega <= 0:
-                    continue
-                ll = self._garch_loglik(rets, omega, alpha, beta, long_run_var)
-                if ll > best_ll:
-                    best_ll, best_params = ll, (omega, alpha, beta)
-
-        if best_params is None:
-            return self.local_vol(window)
-
-        omega, alpha, beta = best_params
-        # Run the recursion forward through the window to get the current
-        # conditional variance, then forecast one step ahead.
-        var = long_run_var
-        for i in range(1, n):
-            var = omega + alpha * rets[i-1]**2 + beta * var
-        next_var = omega + alpha * rets[-1]**2 + beta * var
-        if next_var <= 0:
-            return self.local_vol(window)
-        return math.sqrt(next_var)
-
-    def bootstrap_terminal_paths(self, window: int, duration_s: int,
-                                 n_sims: int) -> List[float]:
-        """
-        Empirical bootstrap: resample actual historical tick returns
-        (with replacement) from the last `window` ticks to build
-        `n_sims` synthetic `duration_s`-tick terminal price paths.
-        Captures the real empirical return distribution (fat tails,
-        skew, jumps) instead of assuming Gaussian returns like the
-        parametric GBM MC does. Returns a list of terminal prices.
-        """
-        rets  = self.returns(window)
-        price = self.current_price()
-        if not rets or not price:
-            return []
-        terminals = []
-        for _ in range(n_sims):
-            p = price
-            for _ in range(duration_s):
-                r = rets[random.randrange(len(rets))]
-                p = p * (1 + r)
-            terminals.append(p)
-        return terminals
 
     def hurst(self, n: int = 80) -> float:
         """
@@ -631,13 +514,10 @@ class ContractSignal:
     contract_type:  str       # "EXPIRYRANGE" | "SKIP"
     symbol:         str
     barrier:        float     # absolute barrier offset (positive, ±barrier)
-    p_win_mc:       float     # GARCH-GBM MC probability estimate
+    p_win_mc:       float     # MC probability estimate
     layer_score:    float     # weighted score from layers 1-4 (0-1)
     rq_score:       float     # RANGE_QUIET composite score (0-1)
     reasons:        List[str]
-    mc_sigma:              float = 0.0   # GARCH one-step-ahead σ used by the MC
-    mc_mu:                 float = 0.0   # drift used by the MC
-    mc_bootstrap_p_win:    float = 0.0   # empirical bootstrap cross-check estimate
 
 
 @dataclass
@@ -650,11 +530,6 @@ class TradeSignal:
     layer_score:    float
     stake:          float
     reasons:        List[str] = field(default_factory=list)
-    mc_sigma:            float = 0.0
-    mc_mu:                float = 0.0
-    mc_bootstrap_p_win:   float = 0.0
-    entry_price:          float = 0.0   # snapshot at signal time, for calibration
-    entry_time:           float = 0.0   # time.monotonic() at signal time
 
 
 # ── RANGE_QUIET regime gate ──────────────────────────────────────────────
@@ -894,24 +769,19 @@ def _proximity_score(ts: TickStore, barrier: float,
 
 
 def mc_p_win_expiryrange(ts: TickStore, barrier: float, duration_s: int,
-                          n_sims: int, window: int) -> Tuple[float, float, float]:
+                          n_sims: int) -> float:
     """
-    Layer 5 — Monte Carlo terminal distribution (GARCH-GBM).
+    Layer 5 — Monte Carlo terminal distribution.
 
-    σ comes from a GARCH(1,1) one-step-ahead conditional-volatility fit
-    (see TickStore.garch_sigma) instead of a flat rolling σ — it reacts
-    to recent shocks rather than averaging them away. µ is still the
-    simple rolling drift over the same shared window.
-
-    Draws N terminal prices from GBM(µ, σ_garch, T=duration_s ticks).
-    Returns (p_win, sigma_used, mu_used) so callers can log/compare
-    what the MC actually assumed.
+    Draws N terminal prices from GBM(µ, σ, T=duration_s ticks).
+    Returns P(|terminal_price - entry_price| < barrier).
+    Closed-form draw: terminal log-return ~ N((µ-σ²/2)T, σ²T).
     """
-    sigma = ts.garch_sigma(window)
-    mu    = ts.local_drift(window)
+    sigma = ts.local_vol(60)
+    mu    = ts.local_drift(60)
     price = ts.current_price()
     if not price or sigma <= 0:
-        return 0.0, sigma, mu
+        return 0.0
 
     mu_T    = (mu - 0.5 * sigma**2) * duration_s
     sigma_T = sigma * math.sqrt(duration_s)
@@ -923,40 +793,14 @@ def mc_p_win_expiryrange(ts: TickStore, barrier: float, duration_s: int,
         terminal = price * math.exp(mu_T + sigma_T * z)
         if abs(terminal - price) < barrier:
             wins += 1
-    return wins / n_sims, sigma, mu
-
-
-def mc_p_win_bootstrap(ts: TickStore, barrier: float, duration_s: int,
-                       n_sims: int, window: int) -> float:
-    """
-    Layer 5 cross-check — empirical bootstrap.
-
-    Resamples actual historical tick returns (with replacement) instead
-    of assuming Gaussian ones, so it naturally reflects whatever fat
-    tails, skew, or recent jumps are actually present in the window —
-    the GARCH-GBM MC above cannot see those by construction.
-
-    Does NOT gate the trade — logged alongside the GARCH-GBM estimate
-    purely for visibility/calibration. If the two disagree a lot, that's
-    a signal the parametric assumption may be off, worth watching in
-    the calibration log rather than acting on immediately.
-    """
-    price = ts.current_price()
-    if not price:
-        return 0.0
-    terminals = ts.bootstrap_terminal_paths(window, duration_s, n_sims)
-    if not terminals:
-        return 0.0
-    wins = sum(1 for t in terminals if abs(t - price) < barrier)
-    return wins / len(terminals)
+    return wins / n_sims
 
 
 def evaluate_signal(ts: TickStore, cfg: dict) -> ContractSignal:
     """
     Runs the RANGE_QUIET regime gate first; only if it passes do layers
     1-4 run, producing a weighted score. If that score >= signal_threshold,
-    Layer 5 runs: the GARCH-GBM MC (which gates on mc_min_confidence) plus
-    the bootstrap cross-check (logged only, not gating).
+    Layer 5 (MC) runs. If MC p(win) >= mc_min_confidence, signal is ACTIVE.
     """
     sym     = ts.symbol
     barrier = cfg["barriers"].get(sym, 1.0)
@@ -1013,26 +857,17 @@ def evaluate_signal(ts: TickStore, cfg: dict) -> ContractSignal:
                               reasons + ["below signal threshold"])
 
     # Layer 5 — Monte Carlo (only runs if RANGE_QUIET + layers 1-4 pass)
-    mc_window = cfg["mc_window"]
-    p_win, mc_sigma, mc_mu = mc_p_win_expiryrange(ts, barrier, dur,
-                                                   cfg["mc_n_sims"], mc_window)
-    boot_p_win = mc_p_win_bootstrap(ts, barrier, dur,
-                                    cfg["mc_bootstrap_n_sims"], mc_window)
-    divergence = abs(p_win - boot_p_win)
+    p_win = mc_p_win_expiryrange(ts, barrier, dur, cfg["mc_n_sims"])
 
-    reasons.append(f"MC(garch) p_win={p_win:.3f} σ={mc_sigma:.6f} µ={mc_mu:+.6f} "
+    reasons.append(f"MC p_win={p_win:.3f} "
                    f"(min={cfg['mc_min_confidence']:.2f})")
-    reasons.append(f"MC(bootstrap) p_win={boot_p_win:.3f} "
-                   f"divergence={divergence:.3f}")
 
     if p_win < cfg["mc_min_confidence"]:
         return ContractSignal("SKIP", sym, barrier, p_win, layer_score, rq_score,
-                              reasons + ["MC below confidence threshold"],
-                              mc_sigma, mc_mu, boot_p_win)
+                              reasons + ["MC below confidence threshold"])
 
     return ContractSignal("EXPIRYRANGE", sym, barrier, p_win,
-                          layer_score, rq_score, reasons,
-                          mc_sigma, mc_mu, boot_p_win)
+                          layer_score, rq_score, reasons)
 
 
 # ============================================================================
@@ -1095,17 +930,6 @@ class PersistenceStore:
                           f"P&L=${eng.total_profit:+.2f}")
         except Exception as exc:
             _log("STORE", f"Failed to parse stats for {sym}: {exc}")
-
-    def save_mc_calibration(self, row: dict):
-        """
-        Appends one row of predicted-vs-realized MC data (see
-        _handle_settlement). Not a merge-duplicates upsert target like
-        the stats table — each trade gets its own row, keyed by
-        contract_id, so a history accumulates for later calibration
-        analysis (e.g. binning by predicted p_win and checking realized
-        win rate per bin).
-        """
-        self._upsert("range_mc_calibration", row)
 
 
 # ============================================================================
@@ -1638,8 +1462,7 @@ class RangeBot:
                       if self.cfg.get("martingale_enabled") and st.martingale_step > 0
                       else "")
             print(f"  → {chosen.contract_type} barrier=±{chosen.barrier:.2f} "
-                  f"p_win(garch)={chosen.p_win_mc:.3f} "
-                  f"p_win(boot)={chosen.mc_bootstrap_p_win:.3f} "
+                  f"p_win={chosen.p_win_mc:.3f} "
                   f"layer_score={chosen.layer_score:.3f} "
                   f"stake=${stake:.2f}{mg_tag}")
         print(f"{'='*60}")
@@ -1657,11 +1480,6 @@ class RangeBot:
             layer_score   = chosen.layer_score,
             stake         = stake,
             reasons       = chosen.reasons,
-            mc_sigma            = chosen.mc_sigma,
-            mc_mu               = chosen.mc_mu,
-            mc_bootstrap_p_win  = chosen.mc_bootstrap_p_win,
-            entry_price         = ts.current_price() or 0.0,
-            entry_time          = time.monotonic(),
         )
 
         # Snap balance before trade
@@ -1708,50 +1526,6 @@ class RangeBot:
         print(f"RESULT  {sym}  contract={cid}")
         print(f"        profit={actual:+.2f}")
         print(f"{'='*60}")
-
-        # ── MC calibration log ──────────────────────────────────────────
-        # Compare what the MC predicted at entry against what actually
-        # happened, before we clear st.current_sig below.
-        if self.cfg.get("mc_calibration_log", False) and st.current_sig:
-            sig = st.current_sig
-            exit_price = (data.get("exit_spot") or data.get("sell_spot")
-                         or data.get("current_spot"))
-            try:
-                exit_price = float(exit_price) if exit_price is not None else None
-            except (TypeError, ValueError):
-                exit_price = None
-            if exit_price is None:
-                exit_price = st.engine.ts.current_price()
-
-            hold_secs = (time.monotonic() - sig.entry_time) if sig.entry_time else None
-            realized_move = (abs(exit_price - sig.entry_price)
-                             if exit_price and sig.entry_price else None)
-            realized_win  = actual > 0
-
-            calib_row = {
-                "contract_id":         cid,
-                "symbol":              sym,
-                "settled_at":          datetime.utcnow().isoformat(),
-                "entry_price":         sig.entry_price,
-                "exit_price":          exit_price,
-                "barrier":             sig.barrier,
-                "predicted_p_win_garch":     sig.p_win_mc,
-                "predicted_p_win_bootstrap": sig.mc_bootstrap_p_win,
-                "mc_sigma":            sig.mc_sigma,
-                "mc_mu":               sig.mc_mu,
-                "hold_secs":           hold_secs,
-                "realized_move":       realized_move,
-                "realized_win":        realized_win,
-                "profit":              actual,
-            }
-            self.store.save_mc_calibration(calib_row)
-
-            move_str = f"{realized_move:.3f}" if realized_move is not None else "?"
-            _log("CALIB",
-                 f"{sym} predicted(garch)={sig.p_win_mc:.3f} "
-                 f"predicted(boot)={sig.mc_bootstrap_p_win:.3f} "
-                 f"σ_used={sig.mc_sigma:.6f} realized_move={move_str} "
-                 f"barrier={sig.barrier:.2f} win={realized_win}")
 
         if actual > 0:
             st.engine.wins += 1
