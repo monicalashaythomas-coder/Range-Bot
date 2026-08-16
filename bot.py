@@ -139,7 +139,7 @@ CONFIG = {
     "use_real_account": _env("DERIV_USE_REAL", False),
 
     # ── Symbols ───────────────────────────────────────────────────
-    "symbols":          ["RDBEAR"],
+    "symbols":          ["1HZ10V", "RDBEAR"],
     "currency":         "USD",
 
     # ── Fixed barriers (confirmed from live API testing) ──────────
