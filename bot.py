@@ -146,8 +146,36 @@ CONFIG = {
     # These are the known-valid barrier sizes for 2-minute expiry.
     # We do not scan for barriers — they are fixed. The signal layers
     # decide whether market conditions justify trading them.
+    # EVERY symbol in "symbols" MUST have an entry here — there is no
+    # silent fallback any more (see _validate_symbol_config). A missing
+    # entry means "I haven't validated a barrier for this symbol against
+    # the live API yet," not "assume 1.0."
+    #
+    # TODO(RDBEAR): 1.0 below is a PLACEHOLDER, not a validated barrier.
+    # RDBEAR trades around 918-926 (vs 1HZ10V's much smaller price scale)
+    # so 1HZ10V's ±1.60 is not a safe stand-in. Confirm the real tradeable
+    # barrier for RDBEAR at 120s expiry via the Deriv API before going live.
     "barriers": {
-        "RDBEAR": 2.5,
+        "1HZ10V": 1.60,
+        "RDBEAR": 1.00,   # PLACEHOLDER — validate before trading real money
+    },
+
+    # ── Per-symbol volatility skip threshold (Layer 2) ─────────────
+    # Different symbols have different baseline tick-to-tick volatility,
+    # so one global vol_skip_thresh does not transfer across symbols.
+    # A single global value (0.000300) tuned for 1HZ10V silently killed
+    # every RDBEAR signal, since RDBEAR's typical σ (~0.00033-0.00043,
+    # observed live) sits above that threshold — Layer 2 hard-skips
+    # whenever σ >= vol_skip, so the signal never even reached Layer 3+
+    # or the Monte Carlo layer.
+    #
+    # "default" is used for any symbol without its own explicit entry.
+    # RDBEAR's value below is set just above its observed live range —
+    # treat it as a starting point to re-tune with more data, not gospel.
+    "vol_skip_thresh": {
+        "default":  _env("VOL_SKIP", 0.000300),
+        "1HZ10V":   _env("VOL_SKIP_1HZ10V", 0.000300),
+        "RDBEAR":   _env("VOL_SKIP_RDBEAR", 0.000500),
     },
 
     # ── Contract duration ─────────────────────────────────────────
@@ -167,7 +195,7 @@ CONFIG = {
     # How many ticks does price typically move in 120 seconds at this vol?
     # Expected move = σ × √120. Barrier must be > expected move for the
     # trade to be reasonable — this ratio gates signal confidence.
-    "vol_skip_thresh":    _env("VOL_SKIP", 0.000300),   # skip if chaos
+    # (per-symbol "vol_skip_thresh" dict is defined above, under Symbols)
     # Layer 3: Hurst
     "hurst_window":       80,
     # Layer 4: Barrier proximity (price vs centre of the range)
@@ -272,6 +300,35 @@ def _ts() -> str:
 
 def _log(tag: str, msg: str):
     print(f"[{_ts()}] [{tag}] {msg}", flush=True)
+
+
+def _sym_vol_skip(cfg: dict, sym: str) -> float:
+    """Per-symbol vol_skip_thresh lookup, falling back to 'default'."""
+    table = cfg["vol_skip_thresh"]
+    return table.get(sym, table["default"])
+
+
+def _validate_symbol_config(cfg: dict) -> List[str]:
+    """
+    Fail loud instead of silently defaulting. Returns a list of problem
+    descriptions (empty list = all good). Called once at startup so a
+    symbol switch (e.g. 1HZ10V -> RDBEAR) can never quietly run with an
+    unvalidated barrier or a vol threshold borrowed from another symbol.
+    """
+    problems = []
+    for sym in cfg["symbols"]:
+        if sym not in cfg["barriers"]:
+            problems.append(
+                f"{sym}: no entry in cfg['barriers'] — refusing to guess "
+                f"a barrier. Add a validated barrier for {sym} first."
+            )
+        if sym not in cfg["vol_skip_thresh"]:
+            _log("CONFIG",
+                 f"{sym}: no per-symbol vol_skip_thresh — using "
+                 f"'default'={cfg['vol_skip_thresh']['default']:.6f}. "
+                 f"This may be miscalibrated for {sym}; consider adding "
+                 f"an explicit entry once you have live σ data.")
+    return problems
 
 
 # ============================================================================
@@ -803,7 +860,7 @@ def evaluate_signal(ts: TickStore, cfg: dict) -> ContractSignal:
     Layer 5 (MC) runs. If MC p(win) >= mc_min_confidence, signal is ACTIVE.
     """
     sym     = ts.symbol
-    barrier = cfg["barriers"].get(sym, 1.0)
+    barrier = cfg["barriers"][sym]   # no fallback — see _validate_symbol_config
     dur     = cfg["duration_s"]
     reasons = []
 
@@ -827,7 +884,7 @@ def evaluate_signal(ts: TickStore, cfg: dict) -> ContractSignal:
     reasons.append(r1)
 
     # Layer 2 — Volatility
-    s2, r2 = _vol_score(ts, cfg["vol_window"], cfg["vol_skip_thresh"], barrier, dur)
+    s2, r2 = _vol_score(ts, cfg["vol_window"], _sym_vol_skip(cfg, sym), barrier, dur)
     reasons.append(r2)
     if s2 == 0.0 and "skip" in r2:
         return ContractSignal("SKIP", sym, barrier, 0.0, 0.0, rq_score,
@@ -1642,6 +1699,14 @@ class RangeBot:
             _log("ERROR", "Set DERIV_APP_ID env var (register at developers.deriv.com)")
             return
 
+        problems = _validate_symbol_config(self.cfg)
+        if problems:
+            for p in problems:
+                _log("ERROR", p)
+            _log("ERROR", "Refusing to start with unconfigured symbol(s) — "
+                           "fix cfg['barriers'] above and restart.")
+            return
+
         if not await self.client.connect():
             return
 
@@ -1764,11 +1829,13 @@ class RangeBot:
                         wr    = eng.wins / total * 100 if total else 0
                         sigma   = eng.ts.local_vol(self.cfg["vol_window"])
                         hurst   = eng.ts.hurst(self.cfg["hurst_window"])
-                        barrier = self.cfg["barriers"].get(sym, "?")
+                        barrier = self.cfg["barriers"].get(sym, "UNCONFIGURED")
                         rq_pass, rq_score, _ = range_quiet_gate(eng.ts, self.cfg)
                         print(f"\n  {sym}: W:{eng.wins} L:{eng.losses} "
                               f"WR:{wr:.1f}% P&L:${eng.total_profit:+.2f}")
-                        print(f"    σ={sigma:.6f}  H={hurst:.3f}  ticks={eng.ts.count}")
+                        vol_skip = _sym_vol_skip(self.cfg, sym)
+                        print(f"    σ={sigma:.6f}  vol_skip={vol_skip:.6f}  "
+                              f"H={hurst:.3f}  ticks={eng.ts.count}")
                         print(f"    barrier ER=±{barrier}  "
                               f"RANGE_QUIET={'PASS' if rq_pass else 'fail'} "
                               f"score={rq_score:.3f}")
