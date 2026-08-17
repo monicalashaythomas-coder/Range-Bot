@@ -1,0 +1,49 @@
+name: Daily RangeBot Model Training
+
+on:
+  schedule:
+    # 07:00 UTC every day — report-only, never auto-publishes
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish to Supabase if it clears the quality bar (150+ trades, sane AUC)?'
+        type: boolean
+        default: false
+      window_days:
+        description: 'Rolling training window in days (0 = all-time history)'
+        type: string
+        default: '21'
+      symbol:
+        description: 'Filter to one symbol (leave blank for all)'
+        type: string
+        default: ''
+      since:
+        description: 'Explicit ISO date — overrides window_days entirely if set (leave blank to use window_days)'
+        type: string
+        default: ''
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests numpy scikit-learn
+
+      - name: Train (and publish only if explicitly requested)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          ARGS="--window-days ${{ inputs.window_days || '21' }}"
+          if [ -n "${{ inputs.symbol }}" ]; then ARGS="$ARGS --symbol ${{ inputs.symbol }}"; fi
+          if [ -n "${{ inputs.since }}" ]; then ARGS="$ARGS --since ${{ inputs.since }}"; fi
+          if [ "${{ inputs.publish }}" = "true" ]; then ARGS="$ARGS --publish"; fi
+          echo "Running: python3 train_model.py $ARGS"
+          python3 train_model.py $ARGS
