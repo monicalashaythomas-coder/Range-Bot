@@ -140,7 +140,7 @@ CONFIG = {
     "use_real_account": _env("DERIV_USE_REAL", False),
 
     # ── Symbols ───────────────────────────────────────────────────
-    "symbols":          ["RDBEAR"],
+    "symbols":          ["1HZ10V", "RDBEAR"],
     "currency":         "USD",
 
     # ── Fixed barriers (confirmed from live API testing) ──────────
@@ -158,7 +158,7 @@ CONFIG = {
     # barrier for RDBEAR at 120s expiry via the Deriv API before going live.
     "barriers": {
         "1HZ10V": 1.60,
-        "RDBEAR": 1.00,   # PLACEHOLDER — validate before trading real money
+        "RDBEAR": 2.60,   # PLACEHOLDER — validate before trading real money
     },
 
     # ── Per-symbol volatility skip threshold (Layer 2) ─────────────
