@@ -140,7 +140,7 @@ CONFIG = {
     "use_real_account": _env("DERIV_USE_REAL", False),
 
     # ── Symbols ───────────────────────────────────────────────────
-    "symbols":          ["1HZ10V", "RDBEAR"],
+    "symbols":          ["RDBEAR"],
     "currency":         "USD",
 
     # ── Fixed barriers (confirmed from live API testing) ──────────
@@ -288,6 +288,18 @@ CONFIG = {
     # ── Persistence ───────────────────────────────────────────────
     "supabase_url":      _env("SUPABASE_URL", ""),
     "supabase_key":      _env("SUPABASE_KEY", ""),
+
+    # ── Remote-tunable config (replaces "edit Railway var, redeploy") ──
+    # The bot polls range_bot_config in Supabase every remote_config_poll_s
+    # seconds. The ML model is always synced from there (shadow-mode only,
+    # zero trading risk). Thresholds that actually gate live trades
+    # (rq_threshold, signal_threshold, mc_min_confidence, vol_skip_thresh,
+    # barriers) only sync if remote_config_enabled is explicitly True —
+    # default is False, so nothing about live trading changes until you
+    # deliberately turn this on. See RangeBot._apply_remote_config.
+    "remote_config_enabled": _env("REMOTE_CONFIG_ENABLED", False),
+    "remote_config_poll_s":  _env("REMOTE_CONFIG_POLL_S", 900),
+    "ml_model": None,   # populated at runtime from range_bot_config, shadow-only
     "persist_every_secs": _env("PERSIST_EVERY_SECS", 120),
 }
 
@@ -784,6 +796,59 @@ def _metrics_snapshot(ts: TickStore, cfg: dict) -> dict:
     return m
 
 
+# ML feature order — MUST match train_model.py's FEATURE_ORDER exactly,
+# since the exported model is just a weight-per-feature-name mapping.
+ML_FEATURE_ORDER = [
+    "ou_theta", "rsi", "stoch_rsi", "boll_width_pct", "zscore",
+    "sr_edge_ratio", "sigma", "hurst", "momentum_short_pct",
+    "momentum_med_pct", "rq_score", "layer_score", "p_win_mc",
+]
+
+
+def _ml_predict(cfg: dict, metrics: dict, sig: "ContractSignal") -> Optional[Tuple[float, str]]:
+    """
+    SHADOW-MODE ONLY. Scores this evaluation with the latest ML model
+    published to Supabase (range_bot_config, key='ml_model'), using a
+    dependency-free logistic regression (dot product + sigmoid — no
+    sklearn needed at runtime). Returns (p_win, model_version) or None
+    if no model has been published yet.
+
+    This value is logged for comparison against outcomes. It is NEVER
+    used to gate, filter, or size a trade — see the explicit comment at
+    the call site in _evaluate_symbol. Promoting it to actually influence
+    trading is a deliberate, separate, human-approved step later.
+    """
+    model = cfg.get("ml_model")
+    if not model or "weights" not in model:
+        return None
+    try:
+        weights = model["weights"]          # {feature_name: coef}
+        bias    = float(model.get("bias", 0.0))
+        means   = model.get("feature_means", {})
+        stds    = model.get("feature_stds", {})
+        version = model.get("version", "unknown")
+
+        feats = dict(metrics)
+        feats["rq_score"]    = sig.rq_score
+        feats["layer_score"] = sig.layer_score
+        feats["p_win_mc"]    = sig.p_win_mc
+
+        z = bias
+        for name in ML_FEATURE_ORDER:
+            v = feats.get(name)
+            if v is None:
+                return None    # incomplete feature vector — skip rather than guess
+            mean = means.get(name, 0.0)
+            std  = stds.get(name, 1.0) or 1.0
+            x = (float(v) - mean) / std
+            z += weights.get(name, 0.0) * x
+        p_win = 1.0 / (1.0 + math.exp(-z))
+        return p_win, version
+    except Exception as exc:
+        _log("ML", f"predict failed: {exc}")
+        return None
+
+
 def _momentum_score(ts: TickStore, short_n: int, medium_n: int) -> Tuple[float, str]:
     """
     Layer 1 — Momentum.
@@ -1049,6 +1114,34 @@ class PersistenceStore:
         except Exception as exc:
             _log("STORE", f"Select failed: {exc}")
             return None
+
+    def load_remote_config(self) -> dict:
+        """
+        Fetch every row from range_bot_config — this is the mechanism
+        that replaces 'edit a Railway env var and redeploy.' Anything
+        tunable (thresholds, the ML model) lives here instead, and both
+        the bot and train_model.py read/write it directly via Supabase.
+        The bot polls this periodically (see RangeBot._remote_config_loop)
+        so changes take effect within ~15 minutes, no redeploy required.
+
+        Returns {} on any failure — callers must treat that as "no
+        change," never as "reset to defaults."
+        """
+        if not self.ok:
+            return {}
+        try:
+            resp = requests.get(
+                f"{self.url}/rest/v1/range_bot_config?select=*",
+                headers=self._headers, timeout=10)
+            if resp.status_code != 200:
+                return {}
+            out = {}
+            for row in resp.json():
+                out[row["key"]] = row.get("value")
+            return out
+        except Exception as exc:
+            _log("STORE", f"load_remote_config failed: {exc}")
+            return {}
 
     def save_symbol_stats(self, sym: str, eng: "SignalEngine"):
         self._upsert("range_symbol_stats", {
@@ -1630,6 +1723,11 @@ class RangeBot:
                   f"stake=${stake:.2f}{mg_tag}")
         print(f"{'='*60}")
 
+        # SHADOW-MODE ML scoring — logged for comparison only, never used
+        # to gate/filter/size this or any trade. See _ml_predict docstring.
+        ml_result = _ml_predict(self.cfg, metrics, sig)
+        ml_p_win, ml_version = ml_result if ml_result else (None, None)
+
         # Log EVERY evaluation — fired or skipped — for gate/threshold tuning.
         self.store.save_signal({
             "session_id":    self.session_id,
@@ -1645,6 +1743,8 @@ class RangeBot:
             "rq_threshold_used":    self.cfg["rq_threshold"],
             "signal_threshold_used": self.cfg["signal_threshold"],
             "mc_min_confidence_used": self.cfg["mc_min_confidence"],
+            "ml_p_win":         ml_p_win,     # SHADOW — not used for `chosen` above
+            "ml_model_version": ml_version,
             **metrics,
             "reasons": " | ".join(sig.reasons),
         })
@@ -1784,6 +1884,19 @@ class RangeBot:
             "mc_mu":            em.get("mc_mu"),
             "mc_sigma":         em.get("mc_sigma"),
             "price_path":       json.dumps(st.price_path),
+            # Raw indicator snapshot at entry — makes this table
+            # self-contained for train_model.py (no join against
+            # range_signals needed, and no risk of matching the wrong row).
+            "ou_theta":            em.get("ou_theta"),
+            "rsi":                 em.get("rsi"),
+            "stoch_rsi":           em.get("stoch_rsi"),
+            "boll_width_pct":      em.get("boll_width_pct"),
+            "zscore":              em.get("zscore"),
+            "sr_edge_ratio":       em.get("sr_edge_ratio"),
+            "sigma":               em.get("sigma"),
+            "hurst":               em.get("hurst"),
+            "momentum_short_pct":  em.get("momentum_short_pct"),
+            "momentum_med_pct":    em.get("momentum_med_pct"),
         })
 
         st.waiting      = False
@@ -1833,6 +1946,57 @@ class RangeBot:
             except Exception as exc:
                 _log("RECONNECT", f"Error: {exc}")
         return False
+
+    async def _apply_remote_config(self):
+        """
+        Pull range_bot_config from Supabase and merge it into self.cfg.
+        This is the replacement for 'edit a Railway env var and redeploy':
+        anything in range_bot_config takes effect within one poll cycle,
+        no deploy needed.
+
+        Two tiers, deliberately separated:
+          - 'ml_model' is ALWAYS synced — it only affects the shadow-mode
+            ml_p_win column that gets logged, never live trading, so
+            there's no real-money risk in auto-picking up a new version.
+          - Everything else (thresholds that actually gate real trades)
+            only syncs if cfg['remote_config_enabled'] is explicitly True.
+            Default is False: until you've decided you trust this pipeline,
+            thresholds stay exactly where you set them in CONFIG/env vars.
+        """
+        remote = self.store.load_remote_config()
+        if not remote:
+            return
+
+        if "ml_model" in remote:
+            new_version = (remote["ml_model"] or {}).get("version")
+            old_version = (self.cfg.get("ml_model") or {}).get("version")
+            if new_version and new_version != old_version:
+                self.cfg["ml_model"] = remote["ml_model"]
+                _log("CONFIG", f"ML shadow model updated: "
+                                f"{old_version} -> {new_version}")
+
+        if not self.cfg.get("remote_config_enabled", False):
+            return
+
+        tunable = ("rq_threshold", "signal_threshold", "mc_min_confidence",
+                   "vol_skip_thresh", "barriers")
+        for key in tunable:
+            if key in remote and remote[key] is not None and remote[key] != self.cfg.get(key):
+                _log("CONFIG", f"Remote update: {key} "
+                                f"{self.cfg.get(key)} -> {remote[key]}")
+                self.cfg[key] = remote[key]
+
+    async def _remote_config_loop(self):
+        """Background poll — see _apply_remote_config for what it does
+        and the safety split between ML (always synced) and live-trading
+        thresholds (opt-in via remote_config_enabled)."""
+        interval = self.cfg.get("remote_config_poll_s", 900)   # 15 min default
+        while not self._stop:
+            try:
+                await self._apply_remote_config()
+            except Exception as exc:
+                _log("CONFIG", f"remote config poll failed: {exc}")
+            await asyncio.sleep(interval)
 
     # ── Main loop ─────────────────────────────────────────────────────────────
 
@@ -1888,7 +2052,12 @@ class RangeBot:
 
         _log("BOT", f"Live — warming up ({self.cfg['min_ticks']} ticks needed per symbol)...")
 
+        # Pick up any ML model / (opt-in) tuned thresholds already
+        # published to Supabase before we start evaluating.
+        await self._apply_remote_config()
+
         console_task = asyncio.create_task(self._console(), name="console")
+        remote_cfg_task = asyncio.create_task(self._remote_config_loop(), name="remote_config")
 
         try:
             while not self._stop:
@@ -1969,6 +2138,7 @@ class RangeBot:
             traceback.print_exc()
         finally:
             console_task.cancel()
+            remote_cfg_task.cancel()
             for sym, st in self.states.items():
                 self.store.save_symbol_stats(sym, st.engine)
             if self.store.ok:
@@ -2115,6 +2285,36 @@ class RangeBot:
 # );
 # CREATE INDEX IF NOT EXISTS range_trades_symbol_idx ON range_trades (symbol);
 # CREATE INDEX IF NOT EXISTS range_trades_contract_id_idx ON range_trades (contract_id);
+#
+# -- Every closed trade's raw indicator snapshot at entry, so this table
+# -- is self-contained for train_model.py — no need to join range_signals.
+# ALTER TABLE range_trades ADD COLUMN IF NOT EXISTS ou_theta             DOUBLE PRECISION;
+# ALTER TABLE range_trades ADD COLUMN IF NOT EXISTS rsi                  DOUBLE PRECISION;
+# ALTER TABLE range_trades ADD COLUMN IF NOT EXISTS stoch_rsi            DOUBLE PRECISION;
+# ALTER TABLE range_trades ADD COLUMN IF NOT EXISTS boll_width_pct       DOUBLE PRECISION;
+# ALTER TABLE range_trades ADD COLUMN IF NOT EXISTS zscore               DOUBLE PRECISION;
+# ALTER TABLE range_trades ADD COLUMN IF NOT EXISTS sr_edge_ratio        DOUBLE PRECISION;
+# ALTER TABLE range_trades ADD COLUMN IF NOT EXISTS sigma                DOUBLE PRECISION;
+# ALTER TABLE range_trades ADD COLUMN IF NOT EXISTS hurst                DOUBLE PRECISION;
+# ALTER TABLE range_trades ADD COLUMN IF NOT EXISTS momentum_short_pct   DOUBLE PRECISION;
+# ALTER TABLE range_trades ADD COLUMN IF NOT EXISTS momentum_med_pct     DOUBLE PRECISION;
+#
+# -- Shadow-mode ML prediction, logged alongside every evaluation (fired or
+# -- skipped) for later comparison against outcomes. Never used to gate a
+# -- trade — see _ml_predict in bot.py.
+# ALTER TABLE range_signals ADD COLUMN IF NOT EXISTS ml_p_win            DOUBLE PRECISION;
+# ALTER TABLE range_signals ADD COLUMN IF NOT EXISTS ml_model_version    TEXT;
+#
+# -- Remote-tunable config — replaces "edit a Railway env var and redeploy."
+# -- The bot polls this table every remote_config_poll_s seconds (default
+# -- 15 min). key='ml_model' is always synced (shadow-mode only, zero
+# -- trading risk). Any other key only takes effect if remote_config_enabled
+# -- is explicitly True — see RangeBot._apply_remote_config.
+# CREATE TABLE IF NOT EXISTS range_bot_config (
+#     key          TEXT PRIMARY KEY,
+#     value        JSONB NOT NULL,
+#     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+# );
 #
 # NOTIFY pgrst, 'reload schema';
 
