@@ -28,9 +28,11 @@ skew risk between training and runtime environments.
 USAGE
     export SUPABASE_URL=...
     export SUPABASE_KEY=...
-    python3 train_model.py                    # train + report only
-    python3 train_model.py --publish           # train + report + publish
-    python3 train_model.py --since 2026-08-16 --symbol 1HZ10V --publish
+    python3 train_model.py                    # last 21 days (default window), report only
+    python3 train_model.py --publish           # last 21 days, report + publish
+    python3 train_model.py --window-days 45 --publish
+    python3 train_model.py --since 2026-08-16 --symbol 1HZ10V --publish   # explicit override
+    python3 train_model.py --window-days 0 --publish   # ALL-TIME history, no window
 """
 
 import argparse
@@ -38,7 +40,7 @@ import json
 import math
 import os
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     import requests
@@ -63,6 +65,12 @@ FEATURE_ORDER = [
 ]
 
 MIN_TRADES_TO_PUBLISH = 150   # below this, a model is more noise than signal
+
+DEFAULT_WINDOW_DAYS = 21   # rolling training window — keeps the model
+                           # reflecting recent behavior instead of getting
+                           # diluted by history as trade volume grows.
+                           # Override with --window-days, or set to 0 /
+                           # pass --since explicitly for all-time history.
 
 
 def fetch_trades(url, key, since=None, symbol=None):
@@ -107,7 +115,7 @@ def build_matrix(rows):
 
 
 def publish_model(url, key, weights: dict, bias: float, means: dict,
-                   stds: dict, n: int, auc: float):
+                   stds: dict, n: int, auc: float, since: str):
     version = datetime.now(timezone.utc).isoformat()
     payload = {
         "key": "ml_model",
@@ -119,6 +127,7 @@ def publish_model(url, key, weights: dict, bias: float, means: dict,
             "feature_stds": stds,
             "trained_on_n": n,
             "cv_auc": auc,
+            "trained_since": since,   # what window produced this — for audit/debugging
             "shadow_only": True,
         },
         "updated_at": version,
@@ -140,7 +149,11 @@ def publish_model(url, key, weights: dict, bias: float, means: dict,
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                   formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--since")
+    ap.add_argument("--since",
+                     help="Explicit ISO date/time — overrides --window-days entirely")
+    ap.add_argument("--window-days", type=int, default=DEFAULT_WINDOW_DAYS,
+                     help=f"Rolling training window in days (default {DEFAULT_WINDOW_DAYS}). "
+                          f"Use 0 for all-time history. Ignored if --since is given.")
     ap.add_argument("--symbol")
     ap.add_argument("--publish", action="store_true",
                      help="Publish to Supabase if the model clears quality bars")
@@ -151,8 +164,19 @@ def main():
     if not url or not key:
         sys.exit("Set SUPABASE_URL and SUPABASE_KEY env vars first.")
 
+    since = args.since
+    if not since and args.window_days > 0:
+        since = (datetime.now(timezone.utc) - timedelta(days=args.window_days)).isoformat()
+
+    if since:
+        print(f"Training window: last {args.window_days} day(s) "
+              f"(since {since})" if not args.since else
+              f"Training window: explicit --since {since}")
+    else:
+        print("Training window: ALL-TIME history (no window applied)")
+
     print("Fetching range_trades...")
-    rows = fetch_trades(url, key, since=args.since, symbol=args.symbol)
+    rows = fetch_trades(url, key, since=since, symbol=args.symbol)
     X, y, kept = build_matrix(rows)
     n = len(y)
     print(f"Loaded {len(rows)} trade rows, {n} usable "
@@ -228,7 +252,7 @@ def main():
               f"Re-run once you have more data.")
         return
 
-    publish_model(url, key, weights, bias, means_d, stds_d, n, mean_auc)
+    publish_model(url, key, weights, bias, means_d, stds_d, n, mean_auc, since)
 
 
 if __name__ == "__main__":
