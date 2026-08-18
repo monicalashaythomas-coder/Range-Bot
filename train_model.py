@@ -155,6 +155,13 @@ def main():
                      help=f"Rolling training window in days (default {DEFAULT_WINDOW_DAYS}). "
                           f"Use 0 for all-time history. Ignored if --since is given.")
     ap.add_argument("--symbol")
+    ap.add_argument("--l1", action="store_true",
+                     help="Use L1 (lasso) regularization instead of the default L2. "
+                          "L1 drives genuinely unhelpful features to exactly zero on "
+                          "its own, inside cross-validation — an unbiased way to check "
+                          "whether only a few features carry real signal, without a "
+                          "human picking favorites after looking at results (which "
+                          "would bias the evaluation).")
     ap.add_argument("--publish", action="store_true",
                      help="Publish to Supabase if the model clears quality bars")
     args = ap.parse_args()
@@ -204,7 +211,14 @@ def main():
     if n_splits < 2:
         sys.exit("Not enough of both classes for cross-validation yet.")
     cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    clf = LogisticRegression(C=0.5, max_iter=1000)
+    if args.l1:
+        # liblinear is the solver that supports l1 penalty for this size of problem
+        clf = LogisticRegression(C=0.5, max_iter=1000, penalty="l1", solver="liblinear")
+        print("\nUsing L1 (lasso) regularization — features driven to exactly "
+              "zero below are ones L1 found no real evidence for, decided "
+              "independently within each cross-validation fold.")
+    else:
+        clf = LogisticRegression(C=0.5, max_iter=1000)
     aucs = []
     for tr_idx, te_idx in cv.split(Xs, y):
         clf.fit(Xs[tr_idx], y[tr_idx])
@@ -239,7 +253,15 @@ def main():
     print("\nLearned weights (standardized features — larger |weight| = "
           "more influence):")
     for f, w in sorted(weights.items(), key=lambda kv: -abs(kv[1])):
-        print(f"  {f:<20} {w:+.3f}")
+        zeroed = "  <- L1 found no evidence for this, zeroed it out" if args.l1 and w == 0.0 else ""
+        print(f"  {f:<20} {w:+.3f}{zeroed}")
+
+    if args.l1:
+        kept = [f for f, w in weights.items() if w != 0.0]
+        dropped = [f for f, w in weights.items() if w == 0.0]
+        print(f"\nL1 kept {len(kept)}/{len(FEATURE_ORDER)} features: {', '.join(kept)}")
+        if dropped:
+            print(f"L1 zeroed out: {', '.join(dropped)}")
 
     if not args.publish:
         print("\n(Dry run — pass --publish to write this to Supabase.)")
