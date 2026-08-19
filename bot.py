@@ -139,22 +139,8 @@ CONFIG = {
     "account_id":       _env("DERIV_ACCOUNT_ID", ""),
     "use_real_account": _env("DERIV_USE_REAL", False),
 
-    # ── Symbols & strategies ─────────────────────────────────────────
-    # Each symbol maps to a LIST of strategies that run independently and
-    # concurrently for it. Each strategy evaluates its own signal on its
-    # own schedule and can fire its own trade with its own barrier — they
-    # are not paired against each other. "expiryrange" = the original
-    # RANGE_QUIET strategy. "touch"/"notouch" = single-barrier ONETOUCH/
-    # NOTOUCH contracts, added for symbols (like RDBEAR) whose real
-    # behavior is "wide-swinging" rather than "quiet range" — see the
-    # RDBEAR structural analysis: EXPIRYRANGE essentially never fires for
-    # it, but its volatility supports Touch/No-Touch at sane barrier
-    # widths (validated against RDBEAR's real logged sigma before this
-    # was added).
-    "symbols": {
-        "1HZ10V": ["expiryrange"],
-        "RDBEAR":  ["touch", "notouch"],
-    },
+    # ── Symbols ───────────────────────────────────────────────────
+    "symbols":          ["RDBEAR"],
     "currency":         "USD",
 
     # ── Fixed barriers (confirmed from live API testing) ──────────
@@ -170,32 +156,10 @@ CONFIG = {
     # RDBEAR trades around 918-926 (vs 1HZ10V's much smaller price scale)
     # so 1HZ10V's ±1.60 is not a safe stand-in. Confirm the real tradeable
     # barrier for RDBEAR at 120s expiry via the Deriv API before going live.
-    # NOTE: this "barriers" dict is used ONLY by the expiryrange strategy
-    # (a symmetric ± range). Touch/No-Touch use their own barrier dicts
-    # below, since they take a single signed barrier, not a symmetric one.
     "barriers": {
         "1HZ10V": 1.60,
         "RDBEAR": 1.00,   # PLACEHOLDER — validate before trading real money
     },
-
-    # ── Touch / No-Touch barriers (single, signed distance from entry) ──
-    # TODO(RDBEAR): both PLACEHOLDERS derived from the feasibility check
-    # against RDBEAR's real logged sigma (median ~0.000384 at 120s):
-    #   touch_barriers   ~±2.2  -> ~60% modeled touch probability
-    #   notouch_barriers ~±4.5  -> a comfortably wide miss-distance
-    # These are starting points for shadow evaluation, NOT validated
-    # against Deriv's actual quoted payout for these barriers yet — that
-    # quote is what determines real edge, not the GBM model alone.
-    "touch_barriers": {
-        "RDBEAR": 2.20,
-    },
-    "notouch_barriers": {
-        "RDBEAR": 4.50,
-    },
-    # Minimum modeled probability required to fire, same spirit as
-    # mc_min_confidence for expiryrange.
-    "touch_min_confidence":   0.55,
-    "notouch_min_confidence": 0.55,
 
     # ── Per-symbol volatility skip threshold (Layer 2) ─────────────
     # Different symbols have different baseline tick-to-tick volatility,
@@ -361,40 +325,22 @@ def _validate_symbol_config(cfg: dict) -> List[str]:
     """
     Fail loud instead of silently defaulting. Returns a list of problem
     descriptions (empty list = all good). Called once at startup so a
-    symbol/strategy switch can never quietly run with an unvalidated
-    barrier or a vol threshold borrowed from another symbol.
-
-    cfg["symbols"] is {symbol: [strategy, ...]} — each strategy for each
-    symbol needs its own validated barrier config, since expiryrange,
-    touch, and notouch each use a different barrier dict.
+    symbol switch (e.g. 1HZ10V -> RDBEAR) can never quietly run with an
+    unvalidated barrier or a vol threshold borrowed from another symbol.
     """
     problems = []
-    for sym, strategies in cfg["symbols"].items():
+    for sym in cfg["symbols"]:
+        if sym not in cfg["barriers"]:
+            problems.append(
+                f"{sym}: no entry in cfg['barriers'] — refusing to guess "
+                f"a barrier. Add a validated barrier for {sym} first."
+            )
         if sym not in cfg["vol_skip_thresh"]:
             _log("CONFIG",
                  f"{sym}: no per-symbol vol_skip_thresh — using "
                  f"'default'={cfg['vol_skip_thresh']['default']:.6f}. "
                  f"This may be miscalibrated for {sym}; consider adding "
                  f"an explicit entry once you have live σ data.")
-        for strat in strategies:
-            if strat == "expiryrange":
-                if sym not in cfg["barriers"]:
-                    problems.append(
-                        f"{sym} (expiryrange): no entry in cfg['barriers'] — "
-                        f"refusing to guess a barrier. Add a validated "
-                        f"barrier for {sym} first.")
-            elif strat == "touch":
-                if sym not in cfg["touch_barriers"]:
-                    problems.append(
-                        f"{sym} (touch): no entry in cfg['touch_barriers'] — "
-                        f"add a barrier before enabling this strategy.")
-            elif strat == "notouch":
-                if sym not in cfg["notouch_barriers"]:
-                    problems.append(
-                        f"{sym} (notouch): no entry in cfg['notouch_barriers'] "
-                        f"— add a barrier before enabling this strategy.")
-            else:
-                problems.append(f"{sym}: unknown strategy '{strat}'")
     return problems
 
 
@@ -634,24 +580,14 @@ class TickStore:
 
 @dataclass
 class ContractSignal:
-    """Result of a strategy's signal evaluation."""
-    contract_type:  str       # "EXPIRYRANGE" | "ONETOUCH" | "NOTOUCH" | "SKIP"
+    """Result of the full RANGE_QUIET + 5-layer intelligence evaluation."""
+    contract_type:  str       # "EXPIRYRANGE" | "SKIP"
     symbol:         str
-    barrier:        float     # unsigned magnitude. For EXPIRYRANGE: ± range
-                               # half-width. For ONETOUCH/NOTOUCH: distance
-                               # from entry in the direction below.
-    p_win_mc:       float     = 0.0    # modeled probability estimate
-    layer_score:    float     = 0.0    # weighted score from layers 1-4 (0-1)
-    rq_score:       float     = 0.0    # RANGE_QUIET composite score (0-1);
-                                        # 0 for touch/notouch, which don't
-                                        # use this gate.
-    reasons:        List[str] = field(default_factory=list)
-    direction:      Optional[str] = None   # 'up' | 'down' — single-barrier
-                                            # contracts only (touch/notouch).
-                                            # None for expiryrange. Placed
-                                            # LAST to preserve positional-arg
-                                            # compatibility with existing
-                                            # ContractSignal(...) call sites.
+    barrier:        float     # absolute barrier offset (positive, ±barrier)
+    p_win_mc:       float     # MC probability estimate
+    layer_score:    float     # weighted score from layers 1-4 (0-1)
+    rq_score:       float     # RANGE_QUIET composite score (0-1)
+    reasons:        List[str]
 
 
 @dataclass
@@ -659,13 +595,12 @@ class TradeSignal:
     """Resolved trade instruction passed to place_trade()."""
     contract_type:  str
     symbol:         str
-    barrier:        float     # unsigned magnitude — see ContractSignal
-    p_win_mc:       float     = 0.0
-    layer_score:    float     = 0.0
+    barrier:        float     # absolute barrier offset (+)
+    p_win_mc:       float
+    layer_score:    float
     rq_score:       float     = 0.0
     stake:          float     = 0.0
     reasons:        List[str] = field(default_factory=list)
-    direction:      Optional[str] = None
 
 
 # ── RANGE_QUIET regime gate ──────────────────────────────────────────────
@@ -1054,7 +989,7 @@ def mc_p_win_expiryrange(ts: TickStore, barrier: float, duration_s: int,
     return wins / n_sims
 
 
-def evaluate_expiryrange_signal(ts: TickStore, cfg: dict) -> ContractSignal:
+def evaluate_signal(ts: TickStore, cfg: dict) -> ContractSignal:
     """
     Runs the RANGE_QUIET regime gate first; only if it passes do layers
     1-4 run, producing a weighted score. If that score >= signal_threshold,
@@ -1126,168 +1061,6 @@ def evaluate_expiryrange_signal(ts: TickStore, cfg: dict) -> ContractSignal:
 
     return ContractSignal("EXPIRYRANGE", sym, barrier, p_win,
                           layer_score, rq_score, reasons)
-
-
-# ============================================================================
-# TOUCH / NO-TOUCH — single-barrier first-passage-time strategy
-# ============================================================================
-#
-# Unlike EXPIRYRANGE (which only cares about the price at expiry),
-# ONETOUCH/NOTOUCH depend on the whole path: did price ever touch a
-# single barrier before expiry, or never. This needs a genuinely
-# different probability model (first-passage time under GBM, via the
-# reflection principle) — not a variant of the terminal-distribution MC
-# used above. The formulas below were validated against brute-force
-# Monte Carlo simulation before being added here (they converge to the
-# continuous-monitoring limit as simulation step size shrinks, which is
-# the right comparison since Deriv settles on live tick data, not
-# discrete checkpoints).
-#
-# Added for RDBEAR specifically: RDBEAR's real logged volatility almost
-# never clears the RANGE_QUIET gate (see the earlier structural
-# analysis — its Bollinger width runs ~23x wider than 1HZ10V's), so
-# EXPIRYRANGE essentially never fires for it. Touch/No-Touch bet on
-# that same width instead of fighting it.
-
-def _norm_cdf(x: float) -> float:
-    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
-
-
-def p_touch_upper(S0: float, H: float, mu: float, sigma: float, T: float) -> float:
-    """P(price touches upper barrier H before time T), H > S0."""
-    if H <= S0 or sigma <= 0 or T <= 0:
-        return 0.0
-    m  = math.log(H / S0)
-    nu = mu - 0.5 * sigma**2
-    sT = sigma * math.sqrt(T)
-    term1 = _norm_cdf((-m + nu * T) / sT)
-    term2 = math.exp(2 * nu * m / sigma**2) * _norm_cdf((-m - nu * T) / sT)
-    return min(max(term1 + term2, 0.0), 1.0)
-
-
-def p_touch_lower(S0: float, L: float, mu: float, sigma: float, T: float) -> float:
-    """P(price touches lower barrier L before time T), L < S0."""
-    if L >= S0 or sigma <= 0 or T <= 0:
-        return 0.0
-    m  = math.log(L / S0)   # negative
-    nu = mu - 0.5 * sigma**2
-    sT = sigma * math.sqrt(T)
-    term1 = _norm_cdf((m - nu * T) / sT)
-    term2 = math.exp(2 * nu * m / sigma**2) * _norm_cdf((m + nu * T) / sT)
-    return min(max(term1 + term2, 0.0), 1.0)
-
-
-def evaluate_touch_signal(ts: TickStore, cfg: dict) -> ContractSignal:
-    """
-    Touch strategy: bet that price WILL touch a barrier before expiry.
-    Does not use the RANGE_QUIET gate (that gate looks for the opposite
-    condition — calm, centered price). Fires when the modeled touch
-    probability clears touch_min_confidence.
-
-    Direction heuristic (FIRST PASS, not backtested — flagged clearly so
-    it's easy to revisit once shadow data accumulates): bet on the
-    barrier in the direction of recent short-term momentum. The
-    reasoning is simple trend-following, not validated against outcomes
-    yet the way the barrier math above was.
-    """
-    sym     = ts.symbol
-    barrier = cfg["touch_barriers"][sym]
-    dur     = cfg["duration_s"]
-    reasons = []
-
-    price = ts.current_price()
-    sigma = ts.local_vol(60)
-    mu    = ts.local_drift(60)
-    if not price or sigma <= 0:
-        return ContractSignal("SKIP", sym, barrier, reasons=["no price/vol data"])
-
-    mom_short, mom_reason = _momentum_score(ts, cfg["momentum_short_n"], cfg["momentum_medium_n"])
-    reasons.append(mom_reason)
-
-    # crude direction pick: use raw short-term momentum sign directly
-    prices = list(ts.prices)
-    n = cfg["momentum_short_n"]
-    direction = "up"
-    if len(prices) > n:
-        raw_mom = prices[-1] - prices[-n - 1]
-        direction = "up" if raw_mom >= 0 else "down"
-    reasons.append(f"touch direction heuristic (short momentum) -> {direction}")
-
-    if direction == "up":
-        p_win = p_touch_upper(price, price + barrier, mu, sigma, dur)
-    else:
-        p_win = p_touch_lower(price, price - barrier, mu, sigma, dur)
-
-    reasons.append(f"p_touch={p_win:.3f} (min={cfg['touch_min_confidence']:.2f}) "
-                   f"barrier={barrier:.2f} direction={direction}")
-
-    if p_win < cfg["touch_min_confidence"]:
-        return ContractSignal("SKIP", sym, barrier, p_win, 0.0, 0.0,
-                              reasons + ["below touch_min_confidence"], direction)
-
-    return ContractSignal("ONETOUCH", sym, barrier, p_win, 0.0, 0.0,
-                          reasons, direction)
-
-
-def evaluate_notouch_signal(ts: TickStore, cfg: dict) -> ContractSignal:
-    """
-    No-Touch strategy: bet that price will NOT touch a (distant) barrier
-    before expiry. Direction heuristic: pick the side OPPOSITE recent
-    momentum (the side price is less likely to reach) — same "first
-    pass, not backtested" caveat as evaluate_touch_signal.
-    """
-    sym     = ts.symbol
-    barrier = cfg["notouch_barriers"][sym]
-    dur     = cfg["duration_s"]
-    reasons = []
-
-    price = ts.current_price()
-    sigma = ts.local_vol(60)
-    mu    = ts.local_drift(60)
-    if not price or sigma <= 0:
-        return ContractSignal("SKIP", sym, barrier, reasons=["no price/vol data"])
-
-    prices = list(ts.prices)
-    n = cfg["momentum_short_n"]
-    direction = "up"   # which barrier we're betting WON'T be touched
-    if len(prices) > n:
-        raw_mom = prices[-1] - prices[-n - 1]
-        # opposite of momentum: if trending up, the upper barrier is MORE
-        # likely to be touched (bad for notouch) — so bet on the lower one.
-        direction = "down" if raw_mom >= 0 else "up"
-    reasons.append(f"notouch direction heuristic (opposite momentum) -> {direction}")
-
-    if direction == "up":
-        p_touch = p_touch_upper(price, price + barrier, mu, sigma, dur)
-    else:
-        p_touch = p_touch_lower(price, price - barrier, mu, sigma, dur)
-    p_win = 1.0 - p_touch
-
-    reasons.append(f"p_notouch={p_win:.3f} (min={cfg['notouch_min_confidence']:.2f}) "
-                   f"barrier={barrier:.2f} direction={direction}")
-
-    if p_win < cfg["notouch_min_confidence"]:
-        return ContractSignal("SKIP", sym, barrier, p_win, 0.0, 0.0,
-                              reasons + ["below notouch_min_confidence"], direction)
-
-    return ContractSignal("NOTOUCH", sym, barrier, p_win, 0.0, 0.0,
-                          reasons, direction)
-
-
-def evaluate_signal(ts: TickStore, cfg: dict, strategy: str) -> ContractSignal:
-    """Dispatcher — routes to the strategy-specific evaluator. Every
-    strategy for every symbol goes through here so call sites never need
-    to know which strategy a symbol is running."""
-    if strategy == "expiryrange":
-        return evaluate_expiryrange_signal(ts, cfg)
-    elif strategy == "touch":
-        return evaluate_touch_signal(ts, cfg)
-    elif strategy == "notouch":
-        return evaluate_notouch_signal(ts, cfg)
-    else:
-        raise ValueError(f"Unknown strategy: {strategy}")
-
-
 
 
 # ============================================================================
@@ -1690,13 +1463,8 @@ class DerivClient:
 
     async def place_trade(self, sig: TradeSignal) -> Optional[str]:
         """
-        Proposal + buy at fixed barrier.
-        EXPIRYRANGE: symmetric ± range, needs barrier + barrier2.
-        ONETOUCH/NOTOUCH: single signed barrier, direction determines sign —
-        Deriv accepts signed-relative barriers for synthetic indices even
-        under 24h duration (confirmed against API docs before this was
-        added — most other symbols need absolute barriers under 24h, but
-        volatility indices are the documented exception).
+        Proposal + buy at fixed barrier. Uses sig.barrier directly.
+        EXPIRYRANGE: barrier + barrier2 (symmetric ±)
         """
         contract_type = sig.contract_type
         barrier       = sig.barrier
@@ -1709,16 +1477,9 @@ class DerivClient:
             "duration":           self.cfg["duration_s"],
             "duration_unit":      self.cfg["duration_unit"],
             "underlying_symbol":  sig.symbol,
+            "barrier":            f"+{barrier:.2f}",
+            "barrier2":           f"-{barrier:.2f}",
         }
-        if contract_type == "EXPIRYRANGE":
-            req["barrier"]  = f"+{barrier:.2f}"
-            req["barrier2"] = f"-{barrier:.2f}"
-        elif contract_type in ("ONETOUCH", "NOTOUCH"):
-            sign = "+" if sig.direction == "up" else "-"
-            req["barrier"] = f"{sign}{barrier:.2f}"
-        else:
-            _log("PROPOSAL", f"Unknown contract_type: {contract_type}")
-            return None
 
         proposal = await self.send_with_id(req, timeout=12)
         if proposal is None or "error" in proposal:
@@ -1735,10 +1496,8 @@ class DerivClient:
             return None
 
         ratio = (payout - ask_price) / ask_price if ask_price > 0 else 0
-        barrier_desc = (f"±{barrier:.2f}" if contract_type == "EXPIRYRANGE"
-                        else f"{req['barrier']}")
         _log("PROPOSAL",
-             f"{contract_type} {sig.symbol} {barrier_desc} "
+             f"{contract_type} {sig.symbol} +{barrier:.2f} "
              f"ask=${ask_price:.2f} payout=${payout:.2f} "
              f"return={ratio*100:.1f}%")
 
@@ -1822,8 +1581,7 @@ class SignalEngine:
 
 @dataclass
 class SymbolState:
-    symbol:           str        # underlying market symbol, e.g. "RDBEAR"
-    strategy:         str        # "expiryrange" | "touch" | "notouch"
+    symbol:           str
     engine:           SignalEngine
     waiting:          bool           = False
     contract_id:      Optional[str]  = None
@@ -1841,14 +1599,6 @@ class SymbolState:
     entry_martingale_step: int        = 0
     price_path:       List[Tuple[float, float]] = field(default_factory=list)  # (t_offset_s, price)
 
-    @property
-    def key(self) -> str:
-        """Composite state key, e.g. 'RDBEAR:touch'. Two strategies on the
-        same symbol run fully independently — separate lock, separate
-        stake/martingale state, separate open trade — they just happen to
-        share the same incoming tick feed (see RangeBot.symbol_to_keys)."""
-        return f"{self.symbol}:{self.strategy}"
-
 
 # ============================================================================
 # MAIN BOT
@@ -1861,22 +1611,11 @@ class RangeBot:
         self.store  = PersistenceStore(cfg)
         self.session_id: str = str(uuid.uuid4())   # groups all rows from this run
 
-        # cfg["symbols"] is {symbol: [strategy, ...]}. self.symbols is the
-        # underlying market symbols (for tick subscription); self.states is
-        # keyed by "symbol:strategy" so each strategy gets its own lock,
-        # stake/martingale tracking, and open-trade state, even when two
-        # strategies share a symbol (e.g. RDBEAR touch + notouch running
-        # concurrently, each free to fire independently on its own barrier).
-        self.symbols: List[str] = list(cfg["symbols"].keys())
-        self.states:  Dict[str, SymbolState] = {}
-        self.symbol_to_keys: Dict[str, List[str]] = {}
-        for sym, strategies in cfg["symbols"].items():
-            self.symbol_to_keys[sym] = []
-            for strat in strategies:
-                st = SymbolState(symbol=sym, strategy=strat,
-                                  engine=SignalEngine(sym, cfg))
-                self.states[st.key] = st
-                self.symbol_to_keys[sym].append(st.key)
+        self.symbols: List[str] = cfg["symbols"]
+        self.states:  Dict[str, SymbolState] = {
+            sym: SymbolState(sym, SignalEngine(sym, cfg))
+            for sym in self.symbols
+        }
 
         self.balance:            float         = 0.0
         self.session_start_bal:  float         = 0.0
@@ -1959,16 +1698,15 @@ class RangeBot:
         sym  = st.symbol
         ts   = st.engine.ts
 
-        # Strategy-appropriate signal evaluation — RANGE_QUIET+5-layer for
-        # expiryrange, first-passage-time model for touch/notouch.
-        sig     = evaluate_signal(ts, self.cfg, st.strategy)
+        # RANGE_QUIET gate + 5-layer EXPIRYRANGE intelligence
+        sig     = evaluate_signal(ts, self.cfg)
         metrics = _metrics_snapshot(ts, self.cfg)
         chosen: Optional[ContractSignal] = sig if sig.contract_type != "SKIP" else None
 
         # Always print the signal block
         print(f"\n{'='*60}")
-        print(f"SIGNAL  {sym} [{st.strategy}]  {_ts()}")
-        print(f"  rq_score={sig.rq_score:.3f}  p_win_mc={sig.p_win_mc:.3f}")
+        print(f"SIGNAL  {sym}  {_ts()}")
+        print(f"  [ER] rq_score={sig.rq_score:.3f}")
         for r in sig.reasons:
             print(f"    · {r}")
         if not chosen:
@@ -1980,7 +1718,6 @@ class RangeBot:
                       if self.cfg.get("martingale_enabled") and st.martingale_step > 0
                       else "")
             print(f"  → {chosen.contract_type} barrier=±{chosen.barrier:.2f} "
-                  f"{'dir='+chosen.direction+' ' if chosen.direction else ''}"
                   f"p_win={chosen.p_win_mc:.3f} "
                   f"layer_score={chosen.layer_score:.3f} "
                   f"stake=${stake:.2f}{mg_tag}")
@@ -1988,24 +1725,16 @@ class RangeBot:
 
         # SHADOW-MODE ML scoring — logged for comparison only, never used
         # to gate/filter/size this or any trade. See _ml_predict docstring.
-        # Only meaningful for expiryrange today — the model was trained on
-        # expiryrange trade features. Skipped for touch/notouch until/if a
-        # strategy-specific model is trained.
-        if st.strategy == "expiryrange":
-            ml_result = _ml_predict(self.cfg, metrics, sig)
-            ml_p_win, ml_version = ml_result if ml_result else (None, None)
-        else:
-            ml_p_win, ml_version = None, None
+        ml_result = _ml_predict(self.cfg, metrics, sig)
+        ml_p_win, ml_version = ml_result if ml_result else (None, None)
 
         # Log EVERY evaluation — fired or skipped — for gate/threshold tuning.
         self.store.save_signal({
             "session_id":    self.session_id,
             "symbol":        sym,
-            "strategy":      st.strategy,
             "ts":            datetime.utcnow().isoformat(),
             "fired":         bool(chosen),
             "contract_type": sig.contract_type,
-            "direction":     sig.direction,
             "rq_score":      sig.rq_score,
             "layer_score":   sig.layer_score,
             "p_win_mc":      sig.p_win_mc,
@@ -2029,7 +1758,6 @@ class RangeBot:
             contract_type = chosen.contract_type,
             symbol        = sym,
             barrier       = chosen.barrier,
-            direction     = chosen.direction,
             p_win_mc      = chosen.p_win_mc,
             layer_score   = chosen.layer_score,
             rq_score      = chosen.rq_score,
@@ -2055,17 +1783,16 @@ class RangeBot:
             st.entry_ts_utc   = datetime.utcnow().isoformat()
             st.entry_martingale_step = st.martingale_step
             st.price_path     = [(0.0, metrics.get("price"))] if metrics.get("price") else []
-            _log("LOCK", f"{sym}[{st.strategy}] waiting on {contract_id}")
+            _log("LOCK", f"{sym} waiting on {contract_id}")
         else:
             st.balance_before = None
 
     # ── Settlement ────────────────────────────────────────────────────────────
 
-    async def _handle_settlement(self, key: str, data: dict):
-        st = self.states.get(key)
+    async def _handle_settlement(self, sym: str, data: dict):
+        st = self.states.get(sym)
         if st is None or not st.waiting:
             return
-        sym = st.symbol
         cid = str(data.get("contract_id", ""))
         if cid != st.contract_id:
             return
@@ -2078,13 +1805,13 @@ class RangeBot:
         if bal_after is not None and st.balance_before is not None:
             actual = round(bal_after - st.balance_before, 2)
             _log("BALANCE",
-                 f"{sym}[{st.strategy}] pre=${st.balance_before:.2f} → post=${bal_after:.2f} "
+                 f"{sym} pre=${st.balance_before:.2f} → post=${bal_after:.2f} "
                  f"| actual={actual:+.2f} | api={api_profit:+.2f}")
         else:
             actual = api_profit
 
         print(f"\n{'='*60}")
-        print(f"RESULT  {sym}[{st.strategy}]  contract={cid}")
+        print(f"RESULT  {sym}  contract={cid}")
         print(f"        profit={actual:+.2f}")
         print(f"{'='*60}")
 
@@ -2094,16 +1821,16 @@ class RangeBot:
             self.total_profit += actual
             st.consec_losses = 0
             if st.martingale_step > 0:
-                _log("MARTINGALE", f"{sym}[{st.strategy}] win at step {st.martingale_step} → reset to base stake")
+                _log("MARTINGALE", f"{sym} win at step {st.martingale_step} → reset to base stake")
             st.martingale_step = 0
-            _log("WIN", f"{sym}[{st.strategy}] +${actual:.2f} | "
+            _log("WIN", f"{sym} +${actual:.2f} | "
                         f"session P&L ${self.total_profit:+.2f}")
         else:
             st.engine.losses += 1
             st.engine.total_profit += actual
             self.total_profit += actual
             st.consec_losses += 1
-            _log("LOSS", f"{sym}[{st.strategy}] ${actual:.2f} | "
+            _log("LOSS", f"{sym} ${actual:.2f} | "
                          f"session P&L ${self.total_profit:+.2f} | "
                          f"streak={st.consec_losses}")
 
@@ -2111,14 +1838,14 @@ class RangeBot:
                 max_steps = self.cfg["martingale_max_steps"]
                 if st.martingale_step >= max_steps:
                     _log("MARTINGALE",
-                         f"{sym}[{st.strategy}] max steps ({max_steps}) reached without a win → "
+                         f"{sym} max steps ({max_steps}) reached without a win → "
                          f"reset to base stake")
                     st.martingale_step = 0
                 else:
                     st.martingale_step += 1
                     next_stake = self._current_stake(st)
                     _log("MARTINGALE",
-                         f"{sym}[{st.strategy}] step → {st.martingale_step}/{max_steps} "
+                         f"{sym} step → {st.martingale_step}/{max_steps} "
                          f"(next stake ${next_stake:.2f})")
 
             limit = self.cfg["consec_loss_limit"]
@@ -2127,7 +1854,7 @@ class RangeBot:
                 st.cb_paused_until = time.monotonic() + pause
                 st.consec_losses   = 0
                 _log("BREAKER",
-                     f"{sym}[{st.strategy}] {limit} consecutive losses → pausing {pause}s")
+                     f"{sym} {limit} consecutive losses → pausing {pause}s")
 
         if bal_after is not None:
             self.balance = bal_after
@@ -2140,7 +1867,6 @@ class RangeBot:
         self.store.save_trade({
             "session_id":       self.session_id,
             "symbol":           sym,
-            "strategy":         st.strategy,
             "contract_id":      cid,
             "opened_at":        st.entry_ts_utc,
             "closed_at":        datetime.utcnow().isoformat(),
@@ -2149,7 +1875,6 @@ class RangeBot:
             "stake":            st.current_sig.stake if st.current_sig else None,
             "martingale_step":  st.entry_martingale_step,
             "barrier":          st.current_sig.barrier if st.current_sig else None,
-            "direction":        st.current_sig.direction if st.current_sig else None,
             "duration_s":       self.cfg["duration_s"],
             "entry_price":      st.entry_price,
             "exit_price":       exit_price,
@@ -2315,11 +2040,9 @@ class RangeBot:
         self.balance           = self.client.initial_balance
         self.session_start_bal = self.client.initial_balance
 
-        # Warm-start persisted stats — keyed by "symbol:strategy" so each
-        # strategy's win/loss history is tracked separately even when two
-        # strategies share a symbol (e.g. RDBEAR touch vs notouch).
-        for key, st in self.states.items():
-            self.store.load_symbol_stats(key, st.engine)
+        # Warm-start persisted stats
+        for sym, st in self.states.items():
+            self.store.load_symbol_stats(sym, st.engine)
 
         # Subscribe to all symbols
         for sym in self.symbols:
@@ -2355,16 +2078,14 @@ class RangeBot:
                             break
                     continue
 
-                # Route ticks to every state watching this market symbol —
-                # RDBEAR touch and notouch both get every RDBEAR tick, even
-                # though they're independent trade states.
+                # Route ticks to the correct symbol's TickStore
                 if "tick" in response:
                     tick = response["tick"]
                     sym  = tick.get("symbol") or tick.get("instrument_id", "")
-                    price = float(tick.get("quote", 0))
-                    for key in self.symbol_to_keys.get(sym, []):
-                        st = self.states[key]
+                    if sym in self.states:
+                        st = self.states[sym]
                         self._check_lock_timeout(st)
+                        price = float(tick.get("quote", 0))
                         st.engine.add_tick(price)
 
                         # While a trade is open, record the actual price path
@@ -2374,17 +2095,17 @@ class RangeBot:
                             t_offset = time.monotonic() - st.lock_since
                             st.price_path.append((round(t_offset, 2), price))
 
-                        # Evaluate (each strategy independently, own lock)
+                        # Periodic persist
+                        now = time.monotonic()
+                        if (self.store.ok and
+                                now - self._last_persist >= self.cfg["persist_every_secs"]):
+                            self._last_persist = now
+                            for s, sx in self.states.items():
+                                self.store.save_symbol_stats(s, sx.engine)
+
+                        # Evaluate
                         if st.engine.is_ready() and not st.waiting:
                             await self._evaluate_symbol(st)
-
-                    # Periodic persist — once per tick event, not per state
-                    now = time.monotonic()
-                    if (self.symbol_to_keys.get(sym) and self.store.ok and
-                            now - self._last_persist >= self.cfg["persist_every_secs"]):
-                        self._last_persist = now
-                        for s, sx in self.states.items():
-                            self.store.save_symbol_stats(s, sx.engine)
 
                 # Settlement
                 if "proposal_open_contract" in response:
@@ -2392,7 +2113,7 @@ class RangeBot:
                     cid = str(poc.get("contract_id", ""))
                     for st in self.states.values():
                         if st.contract_id == cid:
-                            await self._handle_settlement(st.key, poc)
+                            await self._handle_settlement(st.symbol, poc)
                             break
 
                 if "transaction" in response:
@@ -2401,7 +2122,7 @@ class RangeBot:
                     if cid:
                         for st in self.states.values():
                             if st.contract_id == cid:
-                                await self._handle_settlement(st.key, {
+                                await self._handle_settlement(st.symbol, {
                                     "contract_id": cid,
                                     "profit":      tx.get("profit", 0),
                                     "status":      tx.get("action", ""),
@@ -2418,18 +2139,18 @@ class RangeBot:
         finally:
             console_task.cancel()
             remote_cfg_task.cancel()
-            for key, st in self.states.items():
-                self.store.save_symbol_stats(key, st.engine)
+            for sym, st in self.states.items():
+                self.store.save_symbol_stats(sym, st.engine)
             if self.store.ok:
                 _log("STORE", "Final stats saved.")
             await self.client.close()
             print(f"\n{'='*60}")
             print("  FINAL SESSION RESULTS")
             print(f"{'='*60}")
-            for key, st in self.states.items():
+            for sym, st in self.states.items():
                 total = st.engine.wins + st.engine.losses
                 wr    = st.engine.wins / total * 100 if total else 0
-                print(f"  {key}: {total} trades | "
+                print(f"  {sym}: {total} trades | "
                       f"W:{st.engine.wins} L:{st.engine.losses} | "
                       f"WR:{wr:.1f}% | P&L:${st.engine.total_profit:+.2f}")
             print(f"  Session P&L: ${self.total_profit:+.2f}")
@@ -2443,30 +2164,22 @@ class RangeBot:
             try:
                 cmd = (await loop.run_in_executor(None, input)).strip().lower()
                 if cmd == "s":
-                    for key, st in self.states.items():
+                    for sym, st in self.states.items():
                         eng   = st.engine
-                        sym   = st.symbol
                         total = eng.wins + eng.losses
                         wr    = eng.wins / total * 100 if total else 0
                         sigma   = eng.ts.local_vol(self.cfg["vol_window"])
                         hurst   = eng.ts.hurst(self.cfg["hurst_window"])
-                        print(f"\n  {key}: W:{eng.wins} L:{eng.losses} "
+                        barrier = self.cfg["barriers"].get(sym, "UNCONFIGURED")
+                        rq_pass, rq_score, _ = range_quiet_gate(eng.ts, self.cfg)
+                        print(f"\n  {sym}: W:{eng.wins} L:{eng.losses} "
                               f"WR:{wr:.1f}% P&L:${eng.total_profit:+.2f}")
                         vol_skip = _sym_vol_skip(self.cfg, sym)
                         print(f"    σ={sigma:.6f}  vol_skip={vol_skip:.6f}  "
                               f"H={hurst:.3f}  ticks={eng.ts.count}")
-                        if st.strategy == "expiryrange":
-                            barrier = self.cfg["barriers"].get(sym, "UNCONFIGURED")
-                            rq_pass, rq_score, _ = range_quiet_gate(eng.ts, self.cfg)
-                            print(f"    barrier ER=±{barrier}  "
-                                  f"RANGE_QUIET={'PASS' if rq_pass else 'fail'} "
-                                  f"score={rq_score:.3f}")
-                        elif st.strategy == "touch":
-                            barrier = self.cfg["touch_barriers"].get(sym, "UNCONFIGURED")
-                            print(f"    barrier=±{barrier}  (single-sided touch)")
-                        elif st.strategy == "notouch":
-                            barrier = self.cfg["notouch_barriers"].get(sym, "UNCONFIGURED")
-                            print(f"    barrier=±{barrier}  (single-sided no-touch)")
+                        print(f"    barrier ER=±{barrier}  "
+                              f"RANGE_QUIET={'PASS' if rq_pass else 'fail'} "
+                              f"score={rq_score:.3f}")
                         print(f"    waiting={st.waiting}  "
                               f"cb_paused={st.cb_paused_until > time.monotonic()}  "
                               f"martingale_step={st.martingale_step}/{self.cfg['martingale_max_steps']}  "
@@ -2474,21 +2187,16 @@ class RangeBot:
                     print(f"\n  Session P&L: ${self.total_profit:+.2f}  "
                           f"Balance: ${self.balance:.2f}")
                 elif cmd.startswith("u "):
-                    target = cmd[2:].strip().upper()
-                    # Accept either an exact "SYMBOL:strategy" key or a bare
-                    # symbol (unlocks every strategy running on it).
-                    matches = ([target] if target in self.states
-                               else [k for k in self.states if k.upper().startswith(target + ":")])
-                    if matches:
-                        for key in matches:
-                            st = self.states[key]
-                            st.waiting = False
-                            st.contract_id = None
-                            st.current_sig = None
-                            st.lock_since  = None
-                            _log("CMD", f"Unlocked {key}")
+                    sym = cmd[2:].strip().upper()
+                    if sym in self.states:
+                        st = self.states[sym]
+                        st.waiting = False
+                        st.contract_id = None
+                        st.current_sig = None
+                        st.lock_since  = None
+                        _log("CMD", f"Unlocked {sym}")
                     else:
-                        _log("CMD", f"Unknown symbol/key: {target}")
+                        _log("CMD", f"Unknown symbol: {sym}")
                 elif cmd in ("q", "quit", "exit"):
                     _log("CMD", "Quit")
                     self._stop = True
@@ -2607,13 +2315,6 @@ class RangeBot:
 #     value        JSONB NOT NULL,
 #     updated_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 # );
-#
-# -- Multi-strategy support: each symbol can run several strategies
-# -- concurrently (e.g. RDBEAR touch + notouch), each firing independently.
-# ALTER TABLE range_signals ADD COLUMN IF NOT EXISTS strategy  TEXT;
-# ALTER TABLE range_signals ADD COLUMN IF NOT EXISTS direction TEXT;   -- 'up' | 'down', touch/notouch only
-# ALTER TABLE range_trades  ADD COLUMN IF NOT EXISTS strategy  TEXT;
-# ALTER TABLE range_trades  ADD COLUMN IF NOT EXISTS direction TEXT;
 #
 # NOTIFY pgrst, 'reload schema';
 
