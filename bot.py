@@ -152,7 +152,7 @@ CONFIG = {
     # widths (validated against RDBEAR's real logged sigma before this
     # was added).
     "symbols": {
-        "1HZ10V", "R_10": ["expiryrange"],
+        "1HZ10V": ["expiryrange"],
         "RDBEAR":  ["touch", "notouch"],
     },
     "currency":         "USD",
@@ -174,8 +174,8 @@ CONFIG = {
     # (a symmetric ± range). Touch/No-Touch use their own barrier dicts
     # below, since they take a single signed barrier, not a symmetric one.
     "barriers": {
-        "1HZ10V": 1.60,
-        "R_10": 1.00,   # PLACEHOLDER — validate before trading real money
+        "1HZ10V": 1.65,
+        "RDBEAR": 1.00,   # PLACEHOLDER — validate before trading real money
     },
 
     # ── Touch / No-Touch barriers (single, signed distance from entry) ──
@@ -187,15 +187,15 @@ CONFIG = {
     # against Deriv's actual quoted payout for these barriers yet — that
     # quote is what determines real edge, not the GBM model alone.
     "touch_barriers": {
-        "RDBEAR": 2.20,
+        "RDBEAR": 1.20,
     },
     "notouch_barriers": {
         "RDBEAR": 4.50,
     },
     # Minimum modeled probability required to fire, same spirit as
     # mc_min_confidence for expiryrange.
-    "touch_min_confidence":   0.55,
-    "notouch_min_confidence": 0.55,
+    "touch_min_confidence":   0.65,
+    "notouch_min_confidence": 0.65,
 
     # ── Per-symbol volatility skip threshold (Layer 2) ─────────────
     # Different symbols have different baseline tick-to-tick volatility,
