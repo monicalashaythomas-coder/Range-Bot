@@ -152,7 +152,7 @@ CONFIG = {
     # widths (validated against RDBEAR's real logged sigma before this
     # was added).
     "symbols": {
-        "1HZ10V": ["expiryrange"],
+        "1HZ10V", "R_10": ["expiryrange"],
         "RDBEAR":  ["touch", "notouch"],
     },
     "currency":         "USD",
