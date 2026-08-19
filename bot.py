@@ -175,7 +175,7 @@ CONFIG = {
     # below, since they take a single signed barrier, not a symmetric one.
     "barriers": {
         "1HZ10V": 1.60,
-        "RDBEAR": 1.00,   # PLACEHOLDER — validate before trading real money
+        "R_10": 1.00,   # PLACEHOLDER — validate before trading real money
     },
 
     # ── Touch / No-Touch barriers (single, signed distance from entry) ──
