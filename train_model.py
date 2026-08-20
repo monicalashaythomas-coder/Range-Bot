@@ -95,9 +95,34 @@ def fetch_trades(url, key, since=None, symbol=None):
     return rows
 
 
-def build_matrix(rows):
+def build_matrix(rows, strategy="expiryrange"):
+    """
+    Filters to a single strategy before building the feature matrix.
+
+    This matters more than it might look: rq_score and layer_score are
+    HARDCODED to 0.0 for every ONETOUCH/NOTOUCH trade in bot.py (those
+    concepts don't exist for a single-barrier strategy — see
+    evaluate_touch_signal/evaluate_notouch_signal), and p_win_mc means a
+    genuinely different thing per strategy (terminal-range probability
+    for expiryrange vs. first-passage touch probability for touch/
+    notouch) despite sharing one column. Training across a mix silently
+    corrupts standardization and coefficients for every symbol, not just
+    the mixed-in one — this is almost certainly what caused the feature
+    instability (sign flips, reshuffling) once RDBEAR's touch/notouch
+    trades started appearing in range_trades alongside 1HZ10V's
+    expiryrange trades.
+
+    Rows logged before the "strategy" column existed have strategy=None;
+    treated as "expiryrange" since that was the only strategy running
+    at the time (historically accurate, not a guess).
+    """
     X, y, kept = [], [], []
+    skipped_other_strategy = 0
     for r in rows:
+        row_strategy = r.get("strategy") or "expiryrange"
+        if row_strategy != strategy:
+            skipped_other_strategy += 1
+            continue
         feats = []
         ok = True
         for f in FEATURE_ORDER:
@@ -111,6 +136,10 @@ def build_matrix(rows):
         X.append(feats)
         y.append(1 if r.get("outcome") == "win" else 0)
         kept.append(r)
+    if skipped_other_strategy:
+        print(f"Filtered out {skipped_other_strategy} row(s) from a "
+              f"different strategy (not '{strategy}') — see build_matrix "
+              f"docstring for why mixing strategies corrupts training.")
     return np.array(X), np.array(y), kept
 
 
@@ -155,6 +184,14 @@ def main():
                      help=f"Rolling training window in days (default {DEFAULT_WINDOW_DAYS}). "
                           f"Use 0 for all-time history. Ignored if --since is given.")
     ap.add_argument("--symbol")
+    ap.add_argument("--strategy", default="expiryrange",
+                     choices=["expiryrange", "touch", "notouch"],
+                     help="Train on trades from ONE strategy only (default: "
+                          "expiryrange). Mixing strategies corrupts training "
+                          "— see build_matrix docstring. Touch/notouch don't "
+                          "have enough volume yet for their own model, and "
+                          "would need a different feature set anyway (no "
+                          "meaningful rq_score/layer_score/p_win_mc).")
     ap.add_argument("--l1", action="store_true",
                      help="Use L1 (lasso) regularization instead of the default L2. "
                           "L1 drives genuinely unhelpful features to exactly zero on "
@@ -182,12 +219,14 @@ def main():
     else:
         print("Training window: ALL-TIME history (no window applied)")
 
+    print(f"Strategy: {args.strategy}")
     print("Fetching range_trades...")
     rows = fetch_trades(url, key, since=since, symbol=args.symbol)
-    X, y, kept = build_matrix(rows)
+    X, y, kept = build_matrix(rows, strategy=args.strategy)
     n = len(y)
-    print(f"Loaded {len(rows)} trade rows, {n} usable "
-          f"(had every required feature: {', '.join(FEATURE_ORDER)}).")
+    print(f"Loaded {len(rows)} trade rows, {n} usable for strategy="
+          f"'{args.strategy}' (had every required feature: "
+          f"{', '.join(FEATURE_ORDER)}).")
 
     if n < 30:
         sys.exit(f"Only {n} usable trades — need at least 30 to even "

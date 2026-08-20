@@ -10,6 +10,10 @@ on:
         description: 'Publish to Supabase if it clears the quality bar (150+ trades, sane AUC)?'
         type: boolean
         default: false
+      l1:
+        description: 'Use L1 (lasso) regularization instead of the default L2 — lets the model zero out features on its own, an unbiased check on whether only a few features carry real signal'
+        type: boolean
+        default: false
       window_days:
         description: 'Rolling training window in days (0 = all-time history)'
         type: string
@@ -44,6 +48,7 @@ jobs:
           ARGS="--window-days ${{ inputs.window_days || '21' }}"
           if [ -n "${{ inputs.symbol }}" ]; then ARGS="$ARGS --symbol ${{ inputs.symbol }}"; fi
           if [ -n "${{ inputs.since }}" ]; then ARGS="$ARGS --since ${{ inputs.since }}"; fi
+          if [ "${{ inputs.l1 }}" = "true" ]; then ARGS="$ARGS --l1"; fi
           if [ "${{ inputs.publish }}" = "true" ]; then ARGS="$ARGS --publish"; fi
           echo "Running: python3 train_model.py $ARGS"
           python3 train_model.py $ARGS
