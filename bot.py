@@ -194,8 +194,8 @@ CONFIG = {
     },
     # Minimum modeled probability required to fire, same spirit as
     # mc_min_confidence for expiryrange.
-    "touch_min_confidence":   0.55,
-    "notouch_min_confidence": 0.55,
+    "touch_min_confidence":   1.0,
+    "notouch_min_confidence": 1.0,
 
     # ── Per-symbol volatility skip threshold (Layer 2) ─────────────
     # Different symbols have different baseline tick-to-tick volatility,
