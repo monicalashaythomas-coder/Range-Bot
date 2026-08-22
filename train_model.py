@@ -95,6 +95,19 @@ def fetch_trades(url, key, since=None, symbol=None):
     return rows
 
 
+def _is_missing(v) -> bool:
+    """True for None, empty string, or pandas/numpy NaN — NaN is truthy
+    in plain Python, so `v or "x"` silently fails to fall back to "x"
+    when v is NaN (only works for None/empty, e.g. from JSON null via
+    the live Supabase API). Matters because this data sometimes gets
+    analyzed from a pandas-loaded CSV export too, not just the API."""
+    if v is None or v == "":
+        return True
+    if isinstance(v, float) and v != v:
+        return True
+    return False
+
+
 def build_matrix(rows, strategy="expiryrange"):
     """
     Filters to a single strategy before building the feature matrix.
@@ -119,7 +132,7 @@ def build_matrix(rows, strategy="expiryrange"):
     X, y, kept = [], [], []
     skipped_other_strategy = 0
     for r in rows:
-        row_strategy = r.get("strategy") or "expiryrange"
+        row_strategy = "expiryrange" if _is_missing(r.get("strategy")) else r.get("strategy")
         if row_strategy != strategy:
             skipped_other_strategy += 1
             continue
